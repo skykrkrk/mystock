@@ -251,7 +251,7 @@ async function init() {
 
     const badge = document.createElement('span');
     badge.className = 'badge' + (item.isOpen ? ' open' : '');
-    badge.textContent = item.isOpen ? '개장' : '마감';
+    badge.textContent = item.isOpen ? (item.market === '24H' ? '24H' : '개장') : '마감';
 
     const pctSpan = document.createElement('span');
     pctSpan.className = 'flat';
