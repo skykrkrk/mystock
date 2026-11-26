@@ -10,27 +10,6 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-const historyCache = new Map();
-const HISTORY_CACHE_MS = 20 * 1000;
-
-function getCacheKey(id, interval, days) {
-  return `${id}:${interval}:${days}`;
-}
-
-function normalizeCandleTime(seconds, interval) {
-  const bucketSeconds = interval === '1m' ? 60 : interval === '5m' ? 300 : interval === '15m' ? 900 : 60;
-  return Math.floor(seconds / bucketSeconds) * bucketSeconds;
-}
-
-function uniqueSortedPoints(points) {
-  const byTime = new Map();
-  for (const point of points) {
-    if (!Number.isFinite(point.time) || !Number.isFinite(point.value)) continue;
-    byTime.set(point.time, point);
-  }
-  return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
-}
-
 const SYMBOLS = [
   { id: 'KS11',  symbol: '^KS11',     name: '코스피',     market: 'KR',  source: 'yahoo' },
   { id: 'KQ11',  symbol: '^KQ11',     name: '코스닥',     market: 'KR',  source: 'yahoo' },
@@ -84,13 +63,6 @@ app.get('/api/history', async (req, res) => {
   if (!item) return res.status(404).json({ error: 'Unknown symbol' });
 
   try {
-    const cacheKey = getCacheKey(id, interval, days);
-    const cached = historyCache.get(cacheKey);
-    if (cached && Date.now() - cached.createdAt < HISTORY_CACHE_MS) {
-      return res.json(cached.data);
-    }
-
-    let data;
     if (item.source === 'hl') {
       const lookbackMs = (days === 1 ? 36 : 60) * 3600 * 1000;
       const response = await fetch('https://api.hyperliquid.xyz/info', {
@@ -101,31 +73,28 @@ app.get('/api/history', async (req, res) => {
           req: { coin: item.symbol, interval, startTime: Date.now() - lookbackMs, endTime: Date.now() }
         })
       });
-      if (!response.ok) throw new Error(`Hyperliquid history returned ${response.status}`);
       const raw = await response.json();
       const arr = Array.isArray(raw) ? raw : [];
       const points = arr
-        .map(c => ({ time: normalizeCandleTime(Math.floor(c.t / 1000), interval), value: parseFloat(c.c) }))
-        .filter(p => Number.isFinite(p.time) && Number.isFinite(p.value));
-      const uniquePoints = uniqueSortedPoints(points);
+        .map(c => ({ time: Math.floor(c.t / 1000), value: parseFloat(c.c) }))
+        .sort((a, b) => a.time - b.time);
 
-      if (uniquePoints.length === 0) {
-        data = { points: [], prevClose: 0 };
-      } else {
-        const now = new Date();
-        const utcMidnightToday = Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) / 1000);
-        const utcMidnightYesterday = utcMidnightToday - 86400;
+      if (points.length === 0) return res.json({ points: [], prevClose: 0 });
 
-        const beforeToday = uniquePoints.filter(p => p.time < utcMidnightToday);
-        const prevClose = beforeToday.length > 0 ? beforeToday[beforeToday.length - 1].value : uniquePoints[0].value;
+      const now = new Date();
+      const utcMidnightToday = Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) / 1000);
+      const utcMidnightYesterday = utcMidnightToday - 86400;
 
-        const startCut = days === 1 ? utcMidnightToday : utcMidnightYesterday;
-        const displayPoints = uniquePoints.filter(p => p.time >= startCut);
-        data = {
-          points: displayPoints.length > 0 ? displayPoints : uniquePoints.slice(-96),
-          prevClose
-        };
-      }
+      const beforeToday = points.filter(p => p.time < utcMidnightToday);
+      const prevClose = beforeToday.length > 0 ? beforeToday[beforeToday.length - 1].value : points[0].value;
+
+      const startCut = days === 1 ? utcMidnightToday : utcMidnightYesterday;
+      const displayPoints = points.filter(p => p.time >= startCut);
+
+      return res.json({
+        points: displayPoints.length > 0 ? displayPoints : points.slice(-96),
+        prevClose
+      });
     } else {
       const period1 = new Date(Date.now() - 8 * 24 * 3600 * 1000);
       const result = await yahooFinance.chart(item.symbol, { period1, interval });
@@ -135,39 +104,33 @@ app.get('/api/history', async (req, res) => {
       const valid = quotes
         .filter(q => q.close !== null && q.close !== undefined)
         .map(q => ({
-          time: normalizeCandleTime(Math.floor(new Date(q.date).getTime() / 1000), interval),
-          value: parseFloat(q.close),
+          time: Math.floor(new Date(q.date).getTime() / 1000),
+          value: q.close,
           dayStr: new Date(q.date).toLocaleDateString('en-CA', { timeZone: tz })
         }))
-        .filter(v => Number.isFinite(v.time) && Number.isFinite(v.value));
-      const uniqueValid = uniqueSortedPoints(valid.map(({ time, value, dayStr }) => ({ time, value, dayStr })));
+        .sort((a, b) => a.time - b.time);
 
-      if (uniqueValid.length === 0) {
-        data = { points: [], prevClose: 0 };
+      if (valid.length === 0) return res.json({ points: [], prevClose: 0 });
+
+      const uniqueDays = Array.from(new Set(valid.map(v => v.dayStr)));
+      const targetDays = uniqueDays.slice(-days);
+      const displayPoints = valid
+        .filter(v => targetDays.includes(v.dayStr))
+        .map(v => ({ time: v.time, value: v.value }));
+
+      let prevClose = 0;
+      if (uniqueDays.length >= 2) {
+        const prevDayStr = uniqueDays[uniqueDays.length - 2];
+        const prevDayPoints = valid.filter(v => v.dayStr === prevDayStr);
+        prevClose = prevDayPoints[prevDayPoints.length - 1].value;
       } else {
-        const uniqueDays = Array.from(new Set(uniqueValid.map(v => v.dayStr)));
-        const targetDays = uniqueDays.slice(-days);
-        const displayPoints = uniqueValid
-          .filter(v => targetDays.includes(v.dayStr))
-          .map(v => ({ time: v.time, value: v.value }));
-
-        let prevClose = 0;
-        if (uniqueDays.length >= 2) {
-          const prevDayStr = uniqueDays[uniqueDays.length - 2];
-          const prevDayPoints = uniqueValid.filter(v => v.dayStr === prevDayStr);
-          prevClose = prevDayPoints[prevDayPoints.length - 1].value;
-        } else {
-          prevClose = result.meta?.chartPreviousClose || displayPoints[0].value;
-        }
-        data = { points: displayPoints, prevClose };
+        prevClose = result.meta?.chartPreviousClose || displayPoints[0].value;
       }
-    }
 
-    historyCache.set(cacheKey, { createdAt: Date.now(), data });
-    return res.json(data);
+      return res.json({ points: displayPoints, prevClose });
+    }
   } catch (err) {
-    console.error(`History error ${id} ${interval}:`, err.message);
-    return res.status(502).json({ points: [], prevClose: 0, error: 'History source unavailable' });
+    return res.json({ points: [], prevClose: 0 });
   }
 });
 
@@ -227,7 +190,6 @@ const filterOpenEl = document.getElementById('filterOpen');
 const headerTitleEl = document.getElementById('headerTitle');
 const cards = new Map();
 let ws = null;
-let loadGeneration = 0;
 
 const UP_COLOR = '#26a654';
 const DOWN_COLOR = '#ef5350';
@@ -333,46 +295,35 @@ async function init() {
 }
 
 async function loadAll() {
-  const generation = ++loadGeneration;
   const interval = intervalEl.value;
   const days = daysEl.value;
   headerTitleEl.textContent = '시장 모니터 (' + days + '일)';
   if (ws) ws.close();
 
-  const cardEntries = Array.from(cards);
-  for (let start = 0; start < cardEntries.length; start += 4) {
-    if (generation !== loadGeneration) return;
-    await Promise.all(cardEntries.slice(start, start + 4).map(async ([id, ctx]) => {
-      try {
-        const res = await fetch('/api/history?id=' + id + '&interval=' + interval + '&days=' + days);
-        if (!res.ok) throw new Error('History request failed');
-        const { points, prevClose } = await res.json();
-        if (generation !== loadGeneration) return;
-        ctx.prevClose = prevClose;
-        if (ctx.prevLine) { ctx.series.removePriceLine(ctx.prevLine); ctx.prevLine = null; }
-        if (prevClose > 0) {
-          ctx.prevLine = ctx.series.createPriceLine({ price: prevClose, color: '#6b7280', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '' });
-        }
-        if (points && points.length > 0) {
-          ctx.series.setData(points);
-          const last = points[points.length - 1];
-          ctx.lastTime = last.time;
-          updateHeader(ctx, last.value);
-          ctx.chart.timeScale().fitContent();
-        }
-      } catch (e) {
-        console.error(id, e.message);
+  for (const [id, ctx] of cards) {
+    try {
+      const res = await fetch('/api/history?id=' + id + '&interval=' + interval + '&days=' + days);
+      const { points, prevClose } = await res.json();
+      ctx.prevClose = prevClose;
+      if (ctx.prevLine) { ctx.series.removePriceLine(ctx.prevLine); ctx.prevLine = null; }
+      if (prevClose > 0) {
+        ctx.prevLine = ctx.series.createPriceLine({ price: prevClose, color: '#6b7280', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '' });
       }
-    }));
+      if (points && points.length > 0) {
+        ctx.series.setData(points);
+        const last = points[points.length - 1];
+        ctx.lastTime = last.time;
+        updateHeader(ctx, last.value);
+        ctx.chart.timeScale().fitContent();
+      }
+    } catch (e) {}
+    await new Promise(r => setTimeout(r, 120));
   }
-
-  if (generation !== loadGeneration) return;
 
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(protocol + '//' + location.host + '/ws');
   ws.onopen = () => ws.send(JSON.stringify({ action: 'subscribeAll', interval }));
   ws.onmessage = (e) => {
-    if (generation !== loadGeneration) return;
     const msg = JSON.parse(e.data);
     const ctx = cards.get(msg.id);
     if (!ctx || !msg.point) return;
@@ -421,10 +372,7 @@ wss.on('connection', (clientWs) => {
           if (target) {
             clientWs.send(JSON.stringify({
               id: target.id,
-              point: {
-                time: normalizeCandleTime(Math.floor(c.t / 1000), interval),
-                value: parseFloat(c.c)
-              }
+              point: { time: Math.floor(c.t / 1000), value: parseFloat(c.c) }
             }));
           }
         }
@@ -448,10 +396,7 @@ wss.on('connection', (clientWs) => {
           const latest = valid[valid.length - 1];
           clientWs.send(JSON.stringify({
             id: item.id,
-            point: {
-              time: normalizeCandleTime(Math.floor(new Date(latest.date).getTime() / 1000), interval),
-              value: latest.close
-            }
+            point: { time: Math.floor(new Date(latest.date).getTime() / 1000), value: latest.close }
           }));
         }
       } catch (e) {}
