@@ -158,7 +158,7 @@ body.hide-closed .card.closed { display: none; }
 .badge { font-size: 9px; padding: 1px 4px; border-radius: 3px; background: #1e222d; color: #848e9c; }
 .badge.open { color: #26a69a; background: rgba(38,166,154,0.12); }
 .chart { width: 100%; height: 115px; }
-.up { color: #26a69a; }
+.up { color: #26a649; }
 .down { color: #ef5350; }
 .flat { color: #d1d4dc; }
 </style>
