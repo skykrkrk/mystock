@@ -33,7 +33,7 @@ const SYMBOLS = [
   { id: 'KS11',  symbol: '^KS11',     name: '코스피',     market: 'KR',   source: 'yahoo' },
   { id: 'KQ11',  symbol: '^KQ11',     name: '코스닥',     market: 'KR',   source: 'yahoo' },
   { id: 'KS200', symbol: '^KS200',    name: '코스피200',  market: 'KR',   source: 'yahoo' },
-  { id: 'KR200', symbol: 'xyz:KR200', name: '코스피200',  market: '24H',  source: 'hl' },
+  { id: 'KR200', symbol: 'xyz:KR200', name: '코스피200영선', market: '24H', source: 'hl' },
   { id: 'KRW',   symbol: 'KRW=X',     name: '달러/원',    market: 'FX24', source: 'yahoo' },
   { id: 'DXY',   symbol: 'DX-Y.NYB',  name: '달러인덱스', market: 'FX24', source: 'yahoo' },
   { id: 'BZF',   symbol: 'BZ=F',      name: '브렌트유',   market: 'FX24', source: 'yahoo' },
@@ -352,10 +352,10 @@ function updateHeader(ctx, price) {
   ctx.series.applyOptions({ lineColor: color, topColor: color + '33', bottomColor: color + '00' });
 }
 
-function applyStatus(ctx, isOpen) {
+function applyStatus(ctx, isOpen, market) {
   ctx.card.classList.toggle('closed', !isOpen);
   ctx.badge.classList.toggle('open', isOpen);
-  ctx.badge.textContent = isOpen ? '개장' : '마감';
+  ctx.badge.textContent = isOpen ? market : '마감';
 }
 
 async function refreshStatus() {
@@ -364,7 +364,7 @@ async function refreshStatus() {
     const symbols = await res.json();
     for (const s of symbols) {
       const ctx = cards.get(s.id);
-      if (ctx) applyStatus(ctx, s.isOpen);
+      if (ctx) applyStatus(ctx, s.isOpen, s.market);
     }
   } catch (e) {
     console.error('status refresh failed', e);
@@ -404,7 +404,7 @@ async function init() {
 
     const badge = document.createElement('span');
     badge.className = 'badge' + (item.isOpen ? ' open' : '');
-    badge.textContent = item.isOpen ? '개장' : '마감';
+    badge.textContent = item.isOpen ? item.market : '마감';
 
     const pctSpan = document.createElement('span');
     pctSpan.className = 'flat';
