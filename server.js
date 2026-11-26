@@ -13,7 +13,10 @@ const chartLibPath = path.resolve(
 );
 const PORT = Number(process.env.PORT) || 3000;
 // 외부에 공개하려면 HOST=0.0.0.0 으로 실행 (그 경우 인증/Origin 체크 필요)
-const HOST = process.env.HOST || '127.0.0.1';
+// Render
+const HOST = '0.0.0.0';
+// Local
+//const HOST = process.env.HOST || '127.0.0.1';
 
 const HL_REST_URL = 'https://api.hyperliquid.xyz/info';
 const HL_WS_URL = 'wss://api.hyperliquid.xyz/ws';
