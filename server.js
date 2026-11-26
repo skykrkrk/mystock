@@ -158,7 +158,7 @@ body.hide-closed .card.closed { display: none; }
 .badge { font-size: 9px; padding: 1px 4px; border-radius: 3px; background: #1e222d; color: #848e9c; }
 .badge.open { color: #26a69a; background: rgba(38,166,154,0.12); }
 .chart { width: 100%; height: 115px; }
-.up { color: #26a649; }
+.up { color: #26a654; }
 .down { color: #ef5350; }
 .flat { color: #d1d4dc; }
 </style>
@@ -190,7 +190,7 @@ const headerTitleEl = document.getElementById('headerTitle');
 const cards = new Map();
 let ws = null;
 
-const UP_COLOR = '#26a69a';
+const UP_COLOR = '#26a654';
 const DOWN_COLOR = '#ef5350';
 const FLAT_COLOR = '#848e9c';
 
