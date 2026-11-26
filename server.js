@@ -65,7 +65,7 @@ app.get('/api/history', async (req, res) => {
   try {
     if (item.source === 'hl') {
       const lookbackMs = (days === 1 ? 36 : 60) * 3600 * 1000;
-      const response = await fetch('https://hyperliquid.xyz/info', {
+      const response = await fetch('https://api.hyperliquid.xyz/info', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
