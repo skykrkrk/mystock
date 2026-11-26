@@ -174,8 +174,8 @@ body.hide-closed .card.closed { display: none; }
     </select>
     <select id="interval">
       <option value="1m">1분</option>
-      <option value="5m" selected>5분</option>
-      <option value="15m">15분</option>
+      <option value="5m">5분</option>
+      <option value="15m" selected>15분</option>
     </select>
   </div>
 </header>
