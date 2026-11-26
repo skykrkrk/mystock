@@ -13,7 +13,7 @@ const chartLibPath = path.resolve(
 );
 const PORT = Number(process.env.PORT) || 3000;
 // 외부에 공개하려면 HOST=0.0.0.0 으로 실행 (그 경우 인증/Origin 체크 필요)
-const HOST = '0.0.0.0';
+const HOST = process.env.HOST || '127.0.0.1';
 
 const HL_REST_URL = 'https://api.hyperliquid.xyz/info';
 const HL_WS_URL = 'wss://api.hyperliquid.xyz/ws';
@@ -255,9 +255,9 @@ body.hide-closed .card.closed { display: none; }
 .price { font-size: 13px; font-weight: 700; }
 .sub { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; font-size: 11px; }
 .badge { font-size: 9px; padding: 1px 4px; border-radius: 3px; background: #1e222d; color: #848e9c; }
-.badge.open { color: #26a69a; background: rgba(38,166,154,0.12); }
+.badge.open { color: #26a63a; background: rgba(38,166,154,0.12); }
 .chart { width: 100%; height: 115px; }
-.up { color: #26a69a; }
+.up { color: #26a63a; }
 .down { color: #ef5350; }
 .flat { color: #d1d4dc; }
 </style>
@@ -268,13 +268,13 @@ body.hide-closed .card.closed { display: none; }
   <div class="controls">
     <label><input type="checkbox" id="filterOpen" /> 개장 종목만</label>
     <select id="days">
-      <option value="1" selected>1일</option>
-      <option value="2">2일</option>
+      <option value="1">1일</option>
+      <option value="2" selected>2일</option>
     </select>
     <select id="interval">
       <option value="1m">1분</option>
-      <option value="5m" selected>5분</option>
-      <option value="15m">15분</option>
+      <option value="5m">5분</option>
+      <option value="15m" selected>15분</option>
     </select>
   </div>
 </header>
@@ -289,7 +289,7 @@ const filterOpenEl = document.getElementById('filterOpen');
 const headerTitleEl = document.getElementById('headerTitle');
 const cards = new Map();
 
-const UP_COLOR = '#26a69a';
+const UP_COLOR = '#26a63a';
 const DOWN_COLOR = '#ef5350';
 const FLAT_COLOR = '#848e9c';
 const CONCURRENCY = 4;
@@ -383,7 +383,7 @@ async function init() {
 
     const badge = document.createElement('span');
     badge.className = 'badge' + (item.isOpen ? ' open' : '');
-    badge.textContent = item.isOpen ? (item.market === '24H' ? '24H' : '개장') : '마감';
+    badge.textContent = item.isOpen ? '개장' : '마감';
 
     const pctSpan = document.createElement('span');
     pctSpan.className = 'flat';
