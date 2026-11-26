@@ -135,21 +135,39 @@ function cached(key, ttlMs, loader) {
   return promise;
 }
 
+// HL 캔들 조회: 일시 장애(타임아웃, 429, 빈 응답)에 대비해 3회 재시도하고, 실패 시 상태/본문을 남긴다.
+async function fetchHLCandles(item, interval, startTime, endTime) {
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(HL_REST_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'candleSnapshot',
+          req: { coin: item.symbol, interval, startTime, endTime },
+        }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!response.ok) {
+        const body = (await response.text().catch(() => '')).slice(0, 200);
+        throw new Error('HL HTTP ' + response.status + ' ' + body);
+      }
+      const raw = await response.json();
+      if (Array.isArray(raw) && raw.length > 0) return raw;
+      lastErr = new Error('HL 빈 응답: ' + JSON.stringify(raw).slice(0, 200));
+    } catch (e) {
+      lastErr = e;
+    }
+    await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
+  }
+  throw lastErr;
+}
+
 async function loadHistory(item, interval, days) {
   if (item.source === 'hl') {
     const lookbackMs = (days === 1 ? 36 : 60) * 3600 * 1000;
-    const response = await fetch(HL_REST_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'candleSnapshot',
-        req: { coin: item.symbol, interval, startTime: Date.now() - lookbackMs, endTime: Date.now() },
-      }),
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!response.ok) throw new Error('HL HTTP ' + response.status);
-    const raw = await response.json();
-    const arr = Array.isArray(raw) ? raw : [];
+    const arr = await fetchHLCandles(item, interval, Date.now() - lookbackMs, Date.now());
     const points = arr
       .map(c => ({ time: Math.floor(c.t / 1000), value: parseFloat(c.c) }))
       .filter(p => Number.isFinite(p.value))
@@ -432,13 +450,19 @@ async function init() {
   await loadAll();
 }
 
-async function loadOne(id, ctx, interval, days, seq) {
+async function loadOne(id, ctx, interval, days, seq, attempt = 0) {
   try {
     const res = await fetch('/api/history?id=' + encodeURIComponent(id) + '&interval=' + interval + '&days=' + days);
     const data = await res.json();
     if (seq !== loadSeq) return;                       // 더 새로운 요청이 있으면 버림
 
     const points = Array.isArray(data.points) ? data.points : [];
+
+    // HL은 24시간 거래라 빈 결과나 에러는 일시 장애일 가능성이 큼 → 백그라운드 재시도
+    const needRetry = data.error || (ctx.item.source === 'hl' && points.length === 0);
+    if (needRetry && attempt < 3) {
+      setTimeout(() => loadOne(id, ctx, interval, days, seq, attempt + 1), 2000 * (attempt + 1));
+    }
     ctx.prevClose = data.prevClose || 0;
     if (ctx.prevLine) { ctx.series.removePriceLine(ctx.prevLine); ctx.prevLine = null; }
     if (ctx.prevClose > 0) {
@@ -629,7 +653,7 @@ function getFeed(interval) {
   if (feed) return feed;
   feed = {
     interval, clients: new Set(), closed: false,
-    hlWs: null, pingTimer: null, reconnectTimer: null, yahooTimer: null,
+    hlWs: null, pingTimer: null, reconnectTimer: null, yahooTimer: null, idleTimer: null,
     attempts: 0, lastMsg: Date.now(),
   };
   feeds.set(interval, feed);
@@ -643,12 +667,14 @@ function stopFeed(feed) {
   clearInterval(feed.pingTimer);
   clearInterval(feed.yahooTimer);
   clearTimeout(feed.reconnectTimer);
+  clearTimeout(feed.idleTimer);
   if (feed.hlWs) { try { feed.hlWs.close(); } catch {} }
   feeds.delete(feed.interval);
 }
 
 function attach(clientWs, interval) {
   const feed = getFeed(interval);
+  clearTimeout(feed.idleTimer);
   feed.clients.add(clientWs);
   clientWs.feed = feed;
 }
@@ -658,7 +684,13 @@ function detach(clientWs) {
   if (!feed) return;
   feed.clients.delete(clientWs);
   clientWs.feed = null;
-  if (feed.clients.size === 0) stopFeed(feed);
+  if (feed.clients.size === 0) {
+    // 새로고침 직후 재접속하는 경우 HL 소켓을 매번 끊고 새로 열지 않도록 10초 유예
+    clearTimeout(feed.idleTimer);
+    feed.idleTimer = setTimeout(() => {
+      if (feed.clients.size === 0) stopFeed(feed);
+    }, 10_000);
+  }
 }
 
 // ───────────────────────── 클라이언트 WebSocket ─────────────────────────
