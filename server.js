@@ -517,7 +517,8 @@ select { padding: 4px 8px; background: #1e222d; color: #fff; border: 1px solid #
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; padding: 10px; }
 .card { background: #131722; border: 1px solid #222631; border-radius: 6px; padding: 8px 10px 6px; display: flex; flex-direction: column; }
 .card.closed { opacity: 0.55; }
-body.hide-closed .card.closed { display: none; }
+.card.closed.pf { opacity: 1; }
+body.hide-closed .card.closed:not(.pf) { display: none; }
 .top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 2px; }
 .name { font-size: 13px; font-weight: 600; color: #f0f3fa; }
 .ticker { font-size: 10px; color: #787b86; margin-left: 4px; }
@@ -661,6 +662,10 @@ function getMarketBadge(item, isOpen) {
   return item.pfsymbol || item.source === 'yahoo' ? 'PF' : '마감';
 }
 
+function isPfMarket(item, isOpen) {
+  return !isOpen && Boolean(item.pfsymbol || item.source === 'yahoo');
+}
+
 function updateHeader(ctx, price, priceTime = ctx.lastTime) {
   ctx.currentPrice = price;
   ctx.currentPriceTime = priceTime;
@@ -716,7 +721,9 @@ function applyStatus(ctx, isOpen) {
   const changed = ctx.isOpen !== isOpen;
   ctx.isOpen = isOpen;
   ctx.card.classList.toggle('closed', !isOpen);
-  ctx.badge.classList.toggle('open', isOpen);
+  const isPf = isPfMarket(ctx.item, isOpen);
+  ctx.card.classList.toggle('pf', isPf);
+  ctx.badge.classList.toggle('open', isOpen || isPf);
   ctx.badge.textContent = getMarketBadge(ctx.item, isOpen);
   if (changed && ctx.yahooBase) {
     ctx.yahooBase.regular = isOpen;
@@ -746,7 +753,8 @@ async function init() {
 
   for (const item of symbols) {
     const card = document.createElement('div');
-    card.className = 'card' + (item.isOpen ? '' : ' closed');
+    const isPf = isPfMarket(item, item.isOpen);
+    card.className = 'card' + (item.isOpen ? '' : ' closed') + (isPf ? ' pf' : '');
 
     const top = document.createElement('div');
     top.className = 'top';
@@ -780,7 +788,7 @@ async function init() {
     sub.className = 'sub';
 
     const badge = document.createElement('span');
-    badge.className = 'badge' + (item.isOpen ? ' open' : '');
+    badge.className = 'badge' + (item.isOpen || isPf ? ' open' : '');
     badge.textContent = getMarketBadge(item, item.isOpen);
 
     const pctSpan = document.createElement('span');
