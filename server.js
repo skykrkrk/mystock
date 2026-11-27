@@ -20,6 +20,8 @@ const HOST = '0.0.0.0';
 
 const HL_REST_URL = 'https://api.hyperliquid.xyz/info';
 const HL_WS_URL = 'wss://api.hyperliquid.xyz/ws';
+const NAVER_REALTIME_URL = 'https://polling.finance.naver.com/api/realtime?query=SERVICE_INDEX:';
+const NAVER_INDEX_CHART_URL = 'https://api.stock.naver.com/chart/domestic/index/';
 const INTERVALS = new Set(['1m', '5m', '15m']);
 const HISTORY_TTL_MS = 45_000;
 
@@ -30,9 +32,9 @@ const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 1024 });
 
 // market: KR(한국장) / US(미국 정규장) / FX24(평일 24시간, 주말 휴장) / 24H(상시)
 const SYMBOLS = [
-  { id: 'KS11',  symbol: '^KS11',     name: '코스피',     market: 'KR',   source: 'yahoo' },
-  { id: 'KQ11',  symbol: '^KQ11',     name: '코스닥',     market: 'KR',   source: 'yahoo' },
-  { id: 'KS200', symbol: '^KS200',    name: '코스피200',  market: 'KR',   source: 'yahoo' },
+  { id: 'KS11',  symbol: 'KOSPI',     name: '코스피',     market: 'KR',   source: 'naver' },
+  { id: 'KQ11',  symbol: 'KOSDAQ',    name: '코스닥',     market: 'KR',   source: 'naver' },
+  { id: 'KS200', symbol: 'KPI200',    name: '코스피200',  market: 'KR',   source: 'naver' },
   { id: 'KR200', symbol: 'xyz:KR200', name: 'KR200영구선물', market: '24H', source: 'hl' },
   { id: 'KRW',   symbol: 'KRW=X',     name: '원달러환율',  market: 'FX24', source: 'yahoo' },
   { id: 'DXY',   symbol: 'DX-Y.NYB',  name: 'USD Index',  market: 'FX24', source: 'yahoo' },
@@ -54,6 +56,7 @@ const SYMBOLS = [
 
 const HL_ITEMS = SYMBOLS.filter(s => s.source === 'hl');
 const YAHOO_ITEMS = SYMBOLS.filter(s => s.source === 'yahoo');
+const NAVER_ITEMS = SYMBOLS.filter(s => s.source === 'naver');
 const HL_BY_SYMBOL = new Map(HL_ITEMS.map(s => [s.symbol, s]));
 
 // ───────────────────────── 유틸 ─────────────────────────
@@ -166,6 +169,37 @@ async function fetchHLCandles(item, interval, startTime, endTime) {
   throw lastErr;
 }
 
+async function fetchNaverJson(url) {
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      Referer: 'https://stock.naver.com/',
+    },
+    signal: AbortSignal.timeout(8_000),
+  });
+  if (!response.ok) {
+    const body = (await response.text().catch(() => '')).slice(0, 200);
+    throw new Error('Naver HTTP ' + response.status + ' ' + body);
+  }
+  return response.json();
+}
+
+async function fetchNaverIndexHistory(code, startDate, endDate) {
+  const url = NAVER_INDEX_CHART_URL + encodeURIComponent(code) + '/minute' +
+    '?startDateTime=' + startDate + '0900&endDateTime=' + endDate + '1530';
+  const json = await fetchNaverJson(url);
+  if (!Array.isArray(json)) {
+    throw new Error('Naver history unexpected response');
+  }
+  return json;
+}
+
+function parseNaverPrice(value) {
+  if (typeof value === 'number') return value;
+  if (typeof value !== 'string') return NaN;
+  return Number(value.replaceAll(',', '').trim());
+}
+
 async function loadHistory(item, interval, days) {
   if (item.source === 'hl') {
     const lookbackMs = (days === 1 ? 36 : 60) * 3600 * 1000;
@@ -191,6 +225,56 @@ async function loadHistory(item, interval, days) {
       points: displayPoints.length > 0 ? displayPoints : points.slice(-96),
       prevClose,
     };
+  }
+
+  if (item.source === 'naver') {
+    const today = zonedParts(new Date(), 'Asia/Seoul').dateStr;
+    const [year, month, day] = today.split('-').map(Number);
+    const startDate = new Date(Date.UTC(year, month - 1, day - 7))
+      .toISOString().slice(0, 10).replaceAll('-', '');
+    const endDate = today.replaceAll('-', '');
+    const rows = await fetchNaverIndexHistory(item.symbol, startDate, endDate);
+    const minutePoints = rows
+      .map(row => {
+        const stamp = row.localDateTime;
+        if (typeof stamp !== 'string' || !/^\d{14}$/.test(stamp)) return null;
+        const value = parseNaverPrice(row.currentPrice);
+        const day = stamp.slice(0, 8);
+        const minuteOfDay = Number(stamp.slice(8, 10)) * 60 + Number(stamp.slice(10, 12));
+        const intervalMinutes = Number.parseInt(interval, 10);
+        const bucket = Math.floor((minuteOfDay - 540) / intervalMinutes);
+        const bucketTime = Math.floor(new Date(
+          day.slice(0, 4) + '-' + day.slice(4, 6) + '-' + day.slice(6, 8) + 'T09:00:00+09:00'
+        ).getTime() / 1000) + bucket * intervalMinutes * 60;
+        return {
+          time: bucketTime,
+          value,
+          dayStr: day,
+          bucket,
+        };
+      })
+      .filter(p => p && Number.isFinite(p.time) && Number.isFinite(p.value) && p.bucket >= 0)
+      .sort((a, b) => a.time - b.time);
+
+    if (minutePoints.length === 0) return { points: [], prevClose: 0 };
+
+    const buckets = new Map();
+    for (const point of minutePoints) {
+      buckets.set(point.dayStr + ':' + point.bucket, { time: point.time, value: point.value, dayStr: point.dayStr });
+    }
+    const points = Array.from(buckets.values()).sort((a, b) => a.time - b.time);
+    const uniqueDays = Array.from(new Set(points.map(p => p.dayStr)));
+    const targetDays = uniqueDays.slice(-days);
+    const displayPoints = points
+      .filter(p => targetDays.includes(p.dayStr))
+      .map(({ time, value }) => ({ time, value }));
+    const firstDisplayDay = targetDays[0];
+    const previousDayPoints = points.filter(p => p.dayStr < firstDisplayDay);
+    const prevClose = previousDayPoints.length > 0
+      ? previousDayPoints[previousDayPoints.length - 1].value
+      : displayPoints[0].value;
+
+    return { points: displayPoints, prevClose };
   }
 
   // Yahoo: 1분봉은 최근 약 7일까지만 제공 → 6일로 제한
@@ -342,8 +426,8 @@ function fmt(v) {
   return v >= 1000 ? v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : v.toFixed(v < 10 ? 4 : 2);
 }
 
-function updateHeader(ctx, price) {
-  ctx.timeEl.textContent = ctx.lastTime ? kstTime.format(new Date(ctx.lastTime * 1000)) : '';
+function updateHeader(ctx, price, priceTime = ctx.lastTime) {
+  ctx.timeEl.textContent = priceTime ? kstTime.format(new Date(priceTime * 1000)) : '';
   ctx.priceEl.textContent = fmt(price);
   if (!ctx.prevClose || !price) return;
   const diff = price - ctx.prevClose;
@@ -472,8 +556,9 @@ async function loadOne(id, ctx, interval, days, seq, attempt = 0) {
 
     const points = Array.isArray(data.points) ? data.points : [];
 
-    // HL은 24시간 거래라 빈 결과나 에러는 일시 장애일 가능성이 큼 → 백그라운드 재시도
-    const needRetry = data.error || (ctx.item.source === 'hl' && points.length === 0);
+    // HL/Naver는 장애 시 빈 결과가 나올 수 있어 짧게 재시도
+    const needRetry = data.error || (ctx.item.source === 'hl' && points.length === 0) ||
+      (ctx.item.source === 'naver' && points.length === 0);
     if (needRetry && attempt < 3) {
       setTimeout(() => loadOne(id, ctx, interval, days, seq, attempt + 1), 2000 * (attempt + 1));
     }
@@ -487,7 +572,7 @@ async function loadOne(id, ctx, interval, days, seq, attempt = 0) {
     if (points.length > 0) {
       const last = points[points.length - 1];
       ctx.lastTime = last.time;
-      updateHeader(ctx, last.value);
+      updateHeader(ctx, last.value, last.time);
       ctx.chart.timeScale().fitContent();
     }
   } catch (e) {
@@ -519,7 +604,14 @@ function connectWs(seq, interval) {
     let msg;
     try { msg = JSON.parse(e.data); } catch (err) { return; }
     const ctx = cards.get(msg.id);
-    if (!ctx || !msg.point) return;
+    if (!ctx) return;
+    if (msg.quote) {
+      if (Number.isFinite(msg.quote.value) && Number.isFinite(msg.quote.time)) {
+        updateHeader(ctx, msg.quote.value, msg.quote.time);
+      }
+      return;
+    }
+    if (!msg.point) return;
     if (msg.point.time >= ctx.lastTime) {
       ctx.series.update(msg.point);
       ctx.lastTime = msg.point.time;
@@ -662,17 +754,49 @@ function startYahooPoller(feed) {
   }, 1200);
 }
 
+function startNaverPoller(feed) {
+  let busy = false;
+  feed.naverTimer = setInterval(async () => {
+    if (busy || feed.closed || !isMarketOpen('KR')) return;
+    busy = true;
+    try {
+      const updates = await Promise.all(NAVER_ITEMS.map(async item => {
+        const json = await fetchNaverJson(NAVER_REALTIME_URL + encodeURIComponent(item.symbol));
+        if (json.resultCode !== 'success' || !Array.isArray(json.result?.areas)) {
+          throw new Error('Naver realtime unexpected response for ' + item.symbol);
+        }
+        const area = json.result.areas.find(a => a.name === 'SERVICE_INDEX');
+        const quote = area?.datas?.find(d => d.cd === item.symbol);
+        const value = Number(quote?.nv) / 100;
+        const timestamp = Number(json.result.time);
+        if (!quote || !Number.isFinite(value) || !Number.isFinite(timestamp)) {
+          throw new Error('Naver realtime missing quote for ' + item.symbol);
+        }
+        return { id: item.id, quote: { time: Math.floor(timestamp / 1000), value } };
+      }));
+      if (!feed.closed) {
+        for (const update of updates) broadcast(feed, update);
+      }
+    } catch (e) {
+      logThrottled('naver-live', '[Naver] 실시간 폴링 실패:', e?.message || e);
+    } finally {
+      busy = false;
+    }
+  }, 1200);
+}
+
 function getFeed(interval) {
   let feed = feeds.get(interval);
   if (feed) return feed;
   feed = {
     interval, clients: new Set(), closed: false,
-    hlWs: null, pingTimer: null, reconnectTimer: null, yahooTimer: null, idleTimer: null,
+    hlWs: null, pingTimer: null, reconnectTimer: null, yahooTimer: null, naverTimer: null, idleTimer: null,
     attempts: 0, lastMsg: Date.now(),
   };
   feeds.set(interval, feed);
   if (HL_ITEMS.length > 0) connectHL(feed);
   startYahooPoller(feed);
+  if (NAVER_ITEMS.length > 0) startNaverPoller(feed);
   return feed;
 }
 
@@ -680,6 +804,7 @@ function stopFeed(feed) {
   feed.closed = true;
   clearInterval(feed.pingTimer);
   clearInterval(feed.yahooTimer);
+  clearInterval(feed.naverTimer);
   clearTimeout(feed.reconnectTimer);
   clearTimeout(feed.idleTimer);
   if (feed.hlWs) { try { feed.hlWs.close(); } catch {} }
