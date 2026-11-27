@@ -50,30 +50,39 @@ const wss = new WebSocketServer({
 const SYMBOLS = [
   { id: 'KS11',  symbol: 'KOSPI',     name: '코스피',     market: 'KR',   source: 'naver' },
   { id: 'KQ11',  symbol: 'KOSDAQ',    name: '코스닥',     market: 'KR',   source: 'naver' },
-  { id: 'KS200', symbol: 'KPI200',    name: '코스피200',  market: 'KR',   source: 'naver' },
-  { id: 'KR200', symbol: 'xyz:KR200', name: 'KR200영구선물', market: '24H', source: 'hl' },
+  { id: 'KS200', symbol: 'KPI200',    name: '코스피200',  market: 'KR',   source: 'naver', pfsymbol: "xyz:KR200" },
   { id: 'KRW',   symbol: 'KRW=X',     name: '원달러환율',  market: 'FX24', source: 'yahoo' },
   { id: 'DXY',   symbol: 'DX-Y.NYB',  name: 'USD Index',  market: 'FX24', source: 'yahoo' },
-  { id: 'BZF',   symbol: 'BZ=F',      name: 'Brent Oil',  market: 'FX24', source: 'yahoo' },
+  { id: 'BZF',   symbol: 'BZ=F',      name: 'Brent Oil',  market: 'FX24', source: 'yahoo', pfsymbol: "xyz:BRENTOIL" },
   { id: 'BTC',   symbol: 'BTC',       name: 'Bitcoin',    market: '24H',  source: 'hl' },
   { id: 'VIX',   symbol: '^VIX',      name: 'VIX',        market: 'US',   source: 'yahoo' },
   { id: 'GSPC',  symbol: '^GSPC',     name: 'S&P 500',    market: 'US',   source: 'yahoo' },
-  { id: 'NDX',   symbol: '^NDX',      name: 'Nasdaq 100', market: 'US',   source: 'yahoo' },
-  { id: 'ANT',   symbol: 'ANT',       name: 'Anthropic',  market: 'US',   source: 'yahoo' },
-  { id: 'AAPL',  symbol: 'AAPL',      name: 'Apple',      market: 'US',   source: 'yahoo' },
-  { id: 'GOOGL', symbol: 'GOOGL',     name: 'Google',     market: 'US',   source: 'yahoo' },
-  { id: 'NVDA',  symbol: 'NVDA',      name: 'NVIDIA',     market: 'US',   source: 'yahoo' },
-  { id: 'SPCX',  symbol: 'SPCX',      name: 'SPCX',       market: 'US',   source: 'yahoo' },
-  { id: 'SCHD',  symbol: 'SCHD',      name: 'SCHD',       market: 'US',   source: 'yahoo' },
+  { id: 'NDX',   symbol: '^NDX',      name: 'Nasdaq 100', market: 'US',   source: 'yahoo', pfsymbol: "xyz:NDX" },
+  { id: 'ANT',   symbol: 'ANT',       name: 'Anthropic',  market: 'US',   source: 'yahoo', pfsymbol: "xyz:ANT" },
+  { id: 'AAPL',  symbol: 'AAPL',      name: 'Apple',      market: 'US',   source: 'yahoo', pfsymbol: "xyz:AAPL" },
+  { id: 'GOOGL', symbol: 'GOOGL',     name: 'Google',     market: 'US',   source: 'yahoo', pfsymbol: "xyz:GOOGL" },
+  { id: 'NVDA',  symbol: 'NVDA',      name: 'NVIDIA',     market: 'US',   source: 'yahoo', pfsymbol: "xyz:NVDA" },
+  { id: 'SPCX',  symbol: 'SPCX',      name: 'SPCX',       market: 'US',   source: 'yahoo', pfsymbol: "xyz:SPCX" },
+  { id: 'SCHD',  symbol: 'SCHD',      name: 'SCHD',       market: 'US',   source: 'yahoo', pfsymbol: "xyz:SCHD" },
   { id: 'JEPI',  symbol: 'JEPI',      name: 'JEPI',       market: 'US',   source: 'yahoo' },
   { id: 'SPYM',  symbol: 'SPYM',      name: 'SPYM',       market: 'US',   source: 'yahoo' },
   { id: 'QQQM',  symbol: 'QQQM',      name: 'QQQM',       market: 'US',   source: 'yahoo' },
 ];
 
-const HL_ITEMS = SYMBOLS.filter(s => s.source === 'hl');
 const YAHOO_ITEMS = SYMBOLS.filter(s => s.source === 'yahoo');
 const NAVER_ITEMS = SYMBOLS.filter(s => s.source === 'naver');
-const HL_BY_SYMBOL = new Map(HL_ITEMS.map(s => [s.symbol, s]));
+const HL_BY_SYMBOL = new Map();
+for (const item of SYMBOLS) {
+  const coins = new Set([
+    ...(item.source === 'hl' ? [item.symbol] : []),
+    ...(item.pfsymbol ? [item.pfsymbol] : []),
+  ]);
+  for (const coin of coins) {
+    const targets = HL_BY_SYMBOL.get(coin) || [];
+    targets.push(item);
+    HL_BY_SYMBOL.set(coin, targets);
+  }
+}
 
 // ───────────────────────── 유틸 ─────────────────────────
 const lastLog = new Map();
@@ -168,7 +177,7 @@ function cached(key, ttlMs, loader) {
 }
 
 // HL 캔들 조회: 일시 장애(타임아웃, 429, 빈 응답)에 대비해 3회 재시도하고, 실패 시 상태/본문을 남긴다.
-async function fetchHLCandles(item, interval, startTime, endTime) {
+async function fetchHLCandles(coin, interval, startTime, endTime) {
   let lastErr;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -177,7 +186,7 @@ async function fetchHLCandles(item, interval, startTime, endTime) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           type: 'candleSnapshot',
-          req: { coin: item.symbol, interval, startTime, endTime },
+          req: { coin, interval, startTime, endTime },
         }),
         signal: AbortSignal.timeout(8_000),
       });
@@ -221,6 +230,22 @@ async function fetchNaverIndexHistory(code, startDate, endDate) {
   return json;
 }
 
+async function fetchNaverLatestClose(code) {
+  const today = zonedParts(new Date(), 'Asia/Seoul').dateStr;
+  const [year, month, day] = today.split('-').map(Number);
+  const startDate = new Date(Date.UTC(year, month - 1, day - 7))
+    .toISOString().slice(0, 10).replaceAll('-', '');
+  const rows = await fetchNaverIndexHistory(code, startDate, today.replaceAll('-', ''));
+  const latestRow = rows
+    .filter(row => typeof row.localDateTime === 'string' && /^\d{14}$/.test(row.localDateTime))
+    .sort((a, b) => b.localDateTime.localeCompare(a.localDateTime))[0];
+  const close = latestRow ? parseNaverPrice(latestRow.currentPrice) : NaN;
+  if (!Number.isFinite(close) || close <= 0) {
+    throw new Error('Naver latest close unavailable for ' + code);
+  }
+  return close;
+}
+
 function parseNaverPrice(value) {
   if (typeof value === 'number') return value;
   if (typeof value !== 'string') return NaN;
@@ -228,11 +253,17 @@ function parseNaverPrice(value) {
 }
 
 // 15분봉 기준 히스토리(표시 구간 + 전일 종가).
-async function loadBaseHistory(item, days) {
+async function loadBaseHistory(item, days, usePfsymbol = false) {
   const interval = CHART_INTERVAL;
-  if (item.source === 'hl') {
+  if (item.source === 'hl' || usePfsymbol) {
     const lookbackMs = (days === 1 ? 36 : 60) * 3600 * 1000;
-    const arr = await fetchHLCandles(item, interval, Date.now() - lookbackMs, Date.now());
+    const coin = usePfsymbol ? item.pfsymbol : item.symbol;
+    const [arr, regularClose] = await Promise.all([
+      fetchHLCandles(coin, interval, Date.now() - lookbackMs, Date.now()),
+      usePfsymbol && item.source === 'naver'
+        ? fetchNaverLatestClose(item.symbol)
+        : Promise.resolve(0),
+    ]);
     const points = arr
       .map(c => ({ time: Math.floor(c.t / 1000), value: parseFloat(c.c) }))
       .filter(p => Number.isFinite(p.value))
@@ -260,7 +291,7 @@ async function loadBaseHistory(item, days) {
       points: shown,
       prevClose,
       open: Number.isFinite(openRaw) && openRaw > 0 ? openRaw : prevClose,
-      close: shown[shown.length - 1].value,
+      close: usePfsymbol ? regularClose : shown[shown.length - 1].value,
     };
   }
 
@@ -389,11 +420,15 @@ function summarizeYahooQuote(q) {
   const extPrice = positiveNumber(isPre ? q.preMarketPrice : q.postMarketPrice);
   const extTime = toMillis(isPre ? q.preMarketTime : q.postMarketTime);
   const hasExt = state !== 'REGULAR' && extPrice > 0;
+  const fullDayPrice = positiveNumber(q.regularMarketPrice);
+  const fullDayChange = Number.isFinite(q.regularMarketChange) ? q.regularMarketChange : NaN;
+  const previousClose = positiveNumber(fullDayPrice - fullDayChange) ||
+    positiveNumber(q.regularMarketPreviousClose);
   return {
     state,
     open: positiveNumber(q.regularMarketOpen),
-    close: positiveNumber(q.regularMarketPrice),
-    previousClose: positiveNumber(q.regularMarketPreviousClose),
+    close: fullDayPrice,
+    previousClose,
     hasExt,
     price: hasExt ? extPrice : q.regularMarketPrice,       // 헤더에 보여줄 가격 (장외가격 우선)
     time: hasExt && Number.isFinite(extTime) ? extTime : toMillis(q.regularMarketTime),
@@ -430,7 +465,9 @@ app.get('/api/history', async (req, res) => {
 
   try {
     // 15분봉 히스토리는 종목/일수별로 캐시하고 그대로 반환한다.
-    const base = await cached(id + '|' + days, HISTORY_TTL_MS, () => loadBaseHistory(item, days));
+    const usePfsymbol = Boolean(item.pfsymbol && !isMarketOpen(item.market));
+    const cacheKey = id + '|' + days + '|' + (usePfsymbol ? 'hl' : 'regular');
+    const base = await cached(cacheKey, HISTORY_TTL_MS, () => loadBaseHistory(item, days, usePfsymbol));
     // 기준가 재료: 시작가(open) / 정규장 종가(close) / 장외가격 존재 여부(ext). 어떤 값을 쓸지는 클라이언트가 장 상태로 고른다.
     let info = {
       open: base.open || 0,
@@ -446,7 +483,7 @@ app.get('/api/history', async (req, res) => {
         info = {
           open: snap.open || info.open,
           close: snap.close || info.close,
-          previousClose: info.previousClose || snap.previousClose,
+          previousClose: snap.previousClose || info.previousClose,
           ext: snap.hasExt,
           regular: isMarketOpen(item.market),
           price: snap.price,
@@ -619,6 +656,11 @@ function fmt(v) {
   return v >= 1000 ? v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : v.toFixed(v < 10 ? 4 : 2);
 }
 
+function getMarketBadge(item, isOpen) {
+  if (isOpen) return item.market;
+  return item.pfsymbol || item.source === 'yahoo' ? 'PF' : '마감';
+}
+
 function updateHeader(ctx, price, priceTime = ctx.lastTime) {
   ctx.currentPrice = price;
   ctx.currentPriceTime = priceTime;
@@ -642,7 +684,11 @@ function getReferencePrice(ctx) {
   const previousClose = Number.isFinite(base?.previousClose) && base.previousClose > 0
     ? base.previousClose
     : ctx.previousClose;
-  if (ctx.item.market === 'US' && !isRegular && base?.ext &&
+  if (!isRegular && ctx.item.pfsymbol &&
+      Number.isFinite(base?.close) && base.close > 0) {
+    return base.close;
+  }
+  if (!isRegular && ctx.item.source === 'yahoo' && base?.ext &&
       Number.isFinite(base.close) && base.close > 0) {
     return base.close;
   }
@@ -666,12 +712,12 @@ function setReferencePrice(ctx, price) {
   if (ctx.currentPrice > 0) updateHeader(ctx, ctx.currentPrice, ctx.currentPriceTime);
 }
 
-function applyStatus(ctx, isOpen, market) {
+function applyStatus(ctx, isOpen) {
   const changed = ctx.isOpen !== isOpen;
   ctx.isOpen = isOpen;
   ctx.card.classList.toggle('closed', !isOpen);
   ctx.badge.classList.toggle('open', isOpen);
-  ctx.badge.textContent = isOpen ? market : '마감';
+  ctx.badge.textContent = getMarketBadge(ctx.item, isOpen);
   if (changed && ctx.yahooBase) {
     ctx.yahooBase.regular = isOpen;
     setReferencePrice(ctx, getReferencePrice(ctx));
@@ -682,10 +728,13 @@ async function refreshStatus() {
   try {
     const res = await fetch('/api/symbols');
     const symbols = await res.json();
+    let reloadPfsymbolHistory = false;
     for (const s of symbols) {
       const ctx = cards.get(s.id);
-      if (ctx) applyStatus(ctx, s.isOpen, s.market);
+      if (ctx?.item.pfsymbol && ctx.isOpen !== s.isOpen) reloadPfsymbolHistory = true;
+      if (ctx) applyStatus(ctx, s.isOpen);
     }
+    if (reloadPfsymbolHistory) await loadAll();
   } catch (e) {
     console.error('status refresh failed', e);
   }
@@ -732,7 +781,7 @@ async function init() {
 
     const badge = document.createElement('span');
     badge.className = 'badge' + (item.isOpen ? ' open' : '');
-    badge.textContent = item.isOpen ? item.market : '마감';
+    badge.textContent = getMarketBadge(item, item.isOpen);
 
     const pctSpan = document.createElement('span');
     pctSpan.className = 'flat';
@@ -940,10 +989,10 @@ function connectHL(feed) {
   hlWs.on('open', () => {
     feed.attempts = 0;
     feed.lastMsg = Date.now();
-    for (const item of HL_ITEMS) {
+    for (const coin of HL_BY_SYMBOL.keys()) {
       hlWs.send(JSON.stringify({
         method: 'subscribe',
-        subscription: { type: 'candle', coin: item.symbol, interval: feed.interval },
+        subscription: { type: 'candle', coin, interval: feed.interval },
       }));
     }
     clearInterval(feed.pingTimer);
@@ -962,8 +1011,8 @@ function connectHL(feed) {
     if (parsed.channel !== 'candle' || !parsed.data) return;
 
     const c = parsed.data;
-    const target = HL_BY_SYMBOL.get(c.s);
-    if (!target) {
+    const targets = HL_BY_SYMBOL.get(c.s);
+    if (!targets) {
       // xyz:KR200 같은 HIP-3 심볼이 다른 이름으로 오는지 확인용
       logThrottled('hl-unmatched:' + c.s, '[HL] 매칭되지 않는 캔들 심볼 수신:', c.s);
       return;
@@ -972,17 +1021,19 @@ function connectHL(feed) {
     const candleStart = Number(c.t);
     const candleEnd = Number(c.T);
     if (!Number.isFinite(value) || !Number.isFinite(candleStart)) return;
-    broadcast(feed, {
-      id: target.id,
-      point: { time: Math.floor(candleStart / 1000), value },
-    });
-
     const now = Date.now();
-    if (Number.isFinite(candleEnd) && now <= candleEnd) {
+    for (const target of targets) {
+      if (target.source !== 'hl' && isMarketOpen(target.market)) continue;
       broadcast(feed, {
         id: target.id,
-        quote: { time: Math.floor(now / 1000), value },
+        point: { time: Math.floor(candleStart / 1000), value },
       });
+      if (Number.isFinite(candleEnd) && now <= candleEnd) {
+        broadcast(feed, {
+          id: target.id,
+          quote: { time: Math.floor(now / 1000), value },
+        });
+      }
     }
   });
 
@@ -1034,6 +1085,7 @@ function startYahooQuotePoller(feed) {
     try {
       await refreshYahooSnapshot();
       for (const item of YAHOO_ITEMS) {
+        if (item.pfsymbol && !isMarketOpen(item.market)) continue;
         const snap = yahooSnapshot.get(item.symbol);
         if (!snap || !Number.isFinite(snap.price) || !Number.isFinite(snap.time)) {
           logThrottled('yahoo-quote:' + item.id, '[Yahoo] ' + item.id + ' quote 값 없음');
@@ -1114,7 +1166,7 @@ function getFeed(interval) {
     attempts: 0, lastMsg: Date.now(),
   };
   feeds.set(interval, feed);
-  if (HL_ITEMS.length > 0) connectHL(feed);
+  if (HL_BY_SYMBOL.size > 0) connectHL(feed);
   startYahooChartPoller(feed);
   if (YAHOO_ITEMS.length > 0) startYahooQuotePoller(feed);
   if (NAVER_ITEMS.length > 0) startNaverPoller(feed);
