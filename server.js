@@ -403,7 +403,9 @@ body.hide-closed .card.closed { display: none; }
 .sub { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; font-size: 11px; }
 .badge { font-size: 9px; padding: 1px 4px; border-radius: 3px; background: #1e222d; color: #848e9c; }
 .badge.open { color: #26a63a; background: rgba(38,166,154,0.12); }
-.chart { width: 100%; height: 115px; }
+.chart { position: relative; width: 100%; height: 115px; }
+.session-close-marker-layer { position: absolute; inset: 0 54px 22px 0; overflow: hidden; pointer-events: none; z-index: 5; }
+.session-close-marker { position: absolute; top: 0; bottom: 0; border-left: 1px dashed #9ca3af; opacity: 0.75; }
 .up { color: #26a63a; }
 .down { color: #ef5350; }
 .flat { color: #d1d4dc; }
@@ -453,6 +455,76 @@ const kstDate = new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', month
 function tickFormatter(time, type) {
   const d = new Date(Number(time) * 1000);
   return type <= 2 ? kstDate.format(d) : kstTime.format(d);
+}
+
+function getZonedDateParts(date, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return {
+    date: values.year + '-' + values.month + '-' + values.day,
+    minutes: (Number(values.hour) % 24) * 60 + Number(values.minute),
+  };
+}
+
+function getZonedCloseTime(date, timeZone, closeMinutes) {
+  const [year, month, day] = date.split('-').map(Number);
+  const target = Date.UTC(year, month - 1, day, Math.floor(closeMinutes / 60), closeMinutes % 60);
+  let timestamp = target;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const local = getZonedDateParts(new Date(timestamp), timeZone);
+    const [localYear, localMonth, localDay] = local.date.split('-').map(Number);
+    const represented = Date.UTC(
+      localYear, localMonth - 1, localDay,
+      Math.floor(local.minutes / 60), local.minutes % 60
+    );
+    timestamp += target - represented;
+  }
+  return Math.floor(timestamp / 1000);
+}
+
+function getSessionCloseSettings(market) {
+  if (market === 'KR') return { timeZone: 'Asia/Seoul', closeMinutes: 15 * 60 + 30 };
+  if (market === 'US') return { timeZone: 'America/New_York', closeMinutes: 16 * 60 };
+  return null;
+}
+
+function positionSessionCloseMarkers(ctx) {
+  ctx.markerLayer.replaceChildren();
+  if (!ctx.sessionDays.size) return;
+  const settings = getSessionCloseSettings(ctx.item.market);
+  if (!settings) return;
+
+  const timeScale = ctx.chart.timeScale();
+  const range = timeScale.getVisibleRange();
+  if (!range) return;
+  const from = Number(range.from);
+  const to = Number(range.to);
+  const intervalSeconds = Number.parseInt(intervalEl.value, 10) * 60;
+
+  for (const date of ctx.sessionDays) {
+    const closeTime = getZonedCloseTime(date, settings.timeZone, settings.closeMinutes);
+    if (closeTime < from - intervalSeconds || closeTime > to + intervalSeconds) continue;
+
+    let x = timeScale.timeToCoordinate(closeTime);
+    if (x === null) {
+      const index = timeScale.timeToIndex(closeTime, true);
+      if (index === null) continue;
+      const nearestX = timeScale.logicalToCoordinate(index);
+      if (nearestX === null) continue;
+      const nearestTime = timeScale.coordinateToTime(nearestX);
+      if (typeof nearestTime !== 'number' || Math.abs(nearestTime - closeTime) > intervalSeconds) continue;
+      x = timeScale.logicalToCoordinate(index + (nearestTime < closeTime ? 0.5 : -0.5));
+    }
+    if (x === null || x < 0 || x > ctx.chartEl.clientWidth) continue;
+
+    const marker = document.createElement('div');
+    marker.className = 'session-close-marker';
+    marker.style.left = x + 'px';
+    ctx.markerLayer.appendChild(marker);
+  }
 }
 
 filterOpenEl.addEventListener('change', () => {
@@ -573,13 +645,20 @@ async function init() {
     });
 
     const series = chart.addSeries(AreaSeries, { lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false });
+    const markerLayer = document.createElement('div');
+    markerLayer.className = 'session-close-marker-layer';
+    chEl.appendChild(markerLayer);
 
-    cards.set(item.id, {
+    const ctx = {
       item, chart, series, card, badge, prevClose: 0, lastTime: 0, prevLine: null,
-      timeEl: timeSpan,
+      chartEl: chEl, markerLayer, sessionDays: new Set(), timeEl: timeSpan,
       priceEl: priceSpan,
       pctEl: pctSpan
-    });
+    };
+    cards.set(item.id, ctx);
+    const updateMarkers = () => positionSessionCloseMarkers(ctx);
+    chart.timeScale().subscribeVisibleTimeRangeChange(updateMarkers);
+    chart.timeScale().subscribeSizeChange(updateMarkers);
   }
 
   setInterval(refreshStatus, 60000);   // 개장/마감 배지 주기적 갱신
@@ -603,17 +682,23 @@ async function loadOne(id, ctx, interval, days, seq, attempt = 0) {
       }, 2000 * (attempt + 1));
     }
     ctx.prevClose = data.prevClose || 0;
+    const closeSettings = getSessionCloseSettings(ctx.item.market);
+    ctx.sessionDays = new Set(closeSettings
+      ? points.map(point => getZonedDateParts(new Date(point.time * 1000), closeSettings.timeZone).date)
+      : []);
     if (ctx.prevLine) { ctx.series.removePriceLine(ctx.prevLine); ctx.prevLine = null; }
     if (ctx.prevClose > 0) {
       ctx.prevLine = ctx.series.createPriceLine({ price: ctx.prevClose, color: '#6b7280', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '' });
     }
     ctx.series.setData(points);                        // 빈 배열이면 이전 간격의 잔상도 지움
     ctx.lastTime = 0;
+    positionSessionCloseMarkers(ctx);
     if (points.length > 0) {
       const last = points[points.length - 1];
       ctx.lastTime = last.time;
       updateHeader(ctx, last.value, last.time);
       ctx.chart.timeScale().fitContent();
+      positionSessionCloseMarkers(ctx);
     }
   } catch (e) {
     console.error('history load failed:', id, e);
@@ -652,6 +737,11 @@ function connectWs(seq, interval) {
     if (msg.point && msg.point.time >= ctx.lastTime) {
       ctx.series.update(msg.point);
       ctx.lastTime = msg.point.time;
+      const closeSettings = getSessionCloseSettings(ctx.item.market);
+      if (closeSettings) {
+        ctx.sessionDays.add(getZonedDateParts(new Date(msg.point.time * 1000), closeSettings.timeZone).date);
+        positionSessionCloseMarkers(ctx);
+      }
     }
   };
   sock.onerror = () => {};                              // close 이벤트에서 재연결 처리
@@ -800,7 +890,7 @@ function startYahooChartPoller(feed) {
     } finally {
       busy = false;
     }
-  }, 5000);
+  }, 10000);
 }
 
 function startYahooQuotePoller(feed) {
@@ -876,7 +966,7 @@ function startNaverPoller(feed) {
     } finally {
       busy = false;
     }
-  }, 5000);
+  }, 10000);
 }
 
 function getFeed(interval) {
