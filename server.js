@@ -297,9 +297,13 @@ async function loadHistory(item, interval, days) {
 
   const uniqueDays = Array.from(new Set(valid.map(v => v.dayStr)));
   const targetDays = uniqueDays.slice(-days);
-  const displayPoints = valid
-    .filter(v => targetDays.includes(v.dayStr))
-    .map(v => ({ time: v.time, value: v.value }));
+  const displayPoints = item.market === 'FX24'
+    ? valid
+      .filter(v => v.time >= Math.floor((Date.now() - days * 24 * 3600 * 1000) / 1000))
+      .map(v => ({ time: v.time, value: v.value }))
+    : valid
+      .filter(v => targetDays.includes(v.dayStr))
+      .map(v => ({ time: v.time, value: v.value }));
 
   let prevClose = 0;
   if (uniqueDays.length >= 2) {
