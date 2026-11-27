@@ -12,11 +12,10 @@ const chartLibPath = path.resolve(
   'node_modules/lightweight-charts/dist/lightweight-charts.standalone.production.mjs'
 );
 const PORT = Number(process.env.PORT) || 3000;
-// 외부에 공개하려면 HOST=0.0.0.0 으로 실행 (그 경우 인증/Origin 체크 필요)
-// Render
-const HOST = '0.0.0.0';
-// Local
-//const HOST = process.env.HOST || '127.0.0.1';
+// HOST 우선순위: 환경변수 HOST > Render(RENDER 환경변수 자동 설정) 이면 0.0.0.0 > 기본 127.0.0.1(로컬 전용)
+// 외부에 공개되는 환경(Render 등)에서는 아래 WebSocket Origin 검사가 적용된다.
+const HOST = process.env.HOST || (process.env.RENDER ? '0.0.0.0' : '127.0.0.1');
+const MAX_WS_CLIENTS = 200;
 
 const HL_REST_URL = 'https://api.hyperliquid.xyz/info';
 const HL_WS_URL = 'wss://api.hyperliquid.xyz/ws';
@@ -28,7 +27,22 @@ const HISTORY_TTL_MS = 45_000;
 const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 const app = express();
 const server = createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 1024 });
+const wss = new WebSocketServer({
+  server,
+  path: '/ws',
+  maxPayload: 1024,
+  // 동일 Origin(같은 host)에서 온 연결만 허용하고, 동시 접속 수를 제한한다.
+  // Origin 헤더가 없는 클라이언트(브라우저가 아닌 도구)는 허용한다.
+  verifyClient: ({ origin, req }) => {
+    if (wss.clients.size >= MAX_WS_CLIENTS) return false;
+    if (!origin) return true;
+    try {
+      return new URL(origin).host === req.headers.host;
+    } catch {
+      return false;
+    }
+  },
+});
 
 // market: KR(한국장) / US(미국 정규장) / FX24(평일 24시간, 주말 휴장) / 24H(상시)
 const SYMBOLS = [
@@ -77,6 +91,9 @@ const US_HOLIDAYS = new Set([ // 날짜는 미국 동부(ET) 기준
   '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25',
   '2026-06-19', '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25',
 ]);
+const US_EARLY_CLOSE = new Set([ // 13:00 ET 조기 폐장 (추수감사절 다음 날, 크리스마스 이브)
+  '2026-11-27', '2026-12-24',
+]);
 const KR_HOLIDAYS = new Set([ // 날짜는 KST 기준 (주말은 따로 처리)
   '2026-01-01', '2026-02-16', '2026-02-17', '2026-02-18', '2026-03-02',
   '2026-05-01', '2026-05-05', '2026-05-25', '2026-06-03', '2026-08-17',
@@ -86,7 +103,7 @@ const KR_HOLIDAYS = new Set([ // 날짜는 KST 기준 (주말은 따로 처리)
 
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 function zonedParts(date, timeZone) {
-  const parts = new Intl.DateTimeFormat('en-CA', {
+  const parts = new Intl.DateTimeFormat('en-US', {
     timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', weekday: 'short', hour12: false,
   }).formatToParts(date);
@@ -109,7 +126,8 @@ function isMarketOpen(market, now = new Date()) {
     const z = zonedParts(now, 'America/New_York');    // 서머타임 자동 반영
     if (z.dow === 0 || z.dow === 6) return false;
     if (US_HOLIDAYS.has(z.dateStr)) return false;
-    return z.mins >= 570 && z.mins < 960;             // 09:30 ~ 16:00 ET 정규장
+    const closeMins = US_EARLY_CLOSE.has(z.dateStr) ? 13 * 60 : 16 * 60;
+    return z.mins >= 570 && z.mins < closeMins;       // 09:30 ~ 16:00 ET 정규장 (조기 폐장일은 13:00)
   }
   if (market === 'FX24') {                            // 금 17:00 ET ~ 일 17:00 ET 휴장
     const z = zonedParts(now, 'America/New_York');
@@ -311,9 +329,11 @@ async function loadHistory(item, interval, days) {
 
   const uniqueDays = Array.from(new Set(valid.map(v => v.dayStr)));
   const targetDays = uniqueDays.slice(-days);
+  // FX24: "지금" 기준이 아니라 마지막 데이터 시각 기준으로 N일치를 자른다 (주말에도 빈 차트가 되지 않도록)
+  const lastTime = valid[valid.length - 1].time;
   const displayPoints = item.market === 'FX24'
     ? valid
-      .filter(v => v.time >= Math.floor((Date.now() - days * 24 * 3600 * 1000) / 1000))
+      .filter(v => v.time >= lastTime - days * 24 * 3600)
       .map(v => ({ time: v.time, value: v.value }))
     : valid
       .filter(v => targetDays.includes(v.dayStr))
@@ -578,7 +598,9 @@ async function loadOne(id, ctx, interval, days, seq, attempt = 0) {
     const needRetry = data.error || (ctx.item.source === 'hl' && points.length === 0) ||
       (ctx.item.source === 'naver' && points.length === 0);
     if (needRetry && attempt < 3) {
-      setTimeout(() => loadOne(id, ctx, interval, days, seq, attempt + 1), 2000 * (attempt + 1));
+      setTimeout(() => {
+        if (seq === loadSeq) loadOne(id, ctx, interval, days, seq, attempt + 1);   // 낡은 요청이면 재시도 안 함
+      }, 2000 * (attempt + 1));
     }
     ctx.prevClose = data.prevClose || 0;
     if (ctx.prevLine) { ctx.series.removePriceLine(ctx.prevLine); ctx.prevLine = null; }
@@ -623,19 +645,13 @@ function connectWs(seq, interval) {
     try { msg = JSON.parse(e.data); } catch (err) { return; }
     const ctx = cards.get(msg.id);
     if (!ctx) return;
-    if (msg.quote) {
-      if (Number.isFinite(msg.quote.value) && Number.isFinite(msg.quote.time)) {
-        updateHeader(ctx, msg.quote.value, msg.quote.time);
-      }
-      return;
+    // 한 메시지에 quote(헤더용)와 point(차트용)가 함께 올 수 있으므로 둘 다 처리한다.
+    if (msg.quote && Number.isFinite(msg.quote.value) && Number.isFinite(msg.quote.time)) {
+      updateHeader(ctx, msg.quote.value, msg.quote.time);
     }
-    if (!msg.point) return;
-    if (msg.point.time >= ctx.lastTime) {
+    if (msg.point && msg.point.time >= ctx.lastTime) {
       ctx.series.update(msg.point);
       ctx.lastTime = msg.point.time;
-      if (ctx.item.source !== 'yahoo' && ctx.item.source !== 'hl') {
-        updateHeader(ctx, msg.point.value, msg.point.time);
-      }
     }
   };
   sock.onerror = () => {};                              // close 이벤트에서 재연결 처리
@@ -828,7 +844,8 @@ function startNaverPoller(feed) {
     if (busy || feed.closed || !isMarketOpen('KR')) return;
     busy = true;
     try {
-      const updates = await Promise.all(NAVER_ITEMS.map(async item => {
+      // 종목별로 독립 처리: 하나가 실패해도 나머지 업데이트는 그대로 전송한다.
+      const results = await Promise.allSettled(NAVER_ITEMS.map(async item => {
         const json = await fetchNaverJson(NAVER_REALTIME_URL + encodeURIComponent(item.symbol));
         if (json.resultCode !== 'success' || !Array.isArray(json.result?.areas)) {
           throw new Error('Naver realtime unexpected response for ' + item.symbol);
@@ -840,13 +857,22 @@ function startNaverPoller(feed) {
         if (!quote || !Number.isFinite(value) || !Number.isFinite(timestamp)) {
           throw new Error('Naver realtime missing quote for ' + item.symbol);
         }
-        return { id: item.id, quote: { time: Math.floor(timestamp / 1000), value } };
+        const msg = { id: item.id, quote: { time: Math.floor(timestamp / 1000), value } };
+        // 차트 갱신용 point: 정규장 구간(09:00~15:30 KST)일 때만 추가 (히스토리와 같은 버킷 규칙)
+        const mins = zonedParts(new Date(timestamp), 'Asia/Seoul').mins;
+        if (mins >= 540 && mins <= 930) {
+          const bucketTime = getIntervalBucketTime(timestamp, feed.interval);
+          if (Number.isFinite(bucketTime)) msg.point = { time: bucketTime, value };
+        }
+        return msg;
       }));
-      if (!feed.closed) {
-        for (const update of updates) broadcast(feed, update);
+      for (const r of results) {
+        if (r.status === 'fulfilled') {
+          if (!feed.closed) broadcast(feed, r.value);
+        } else {
+          logThrottled('naver-live', '[Naver] 실시간 폴링 실패:', r.reason?.message || r.reason);
+        }
       }
-    } catch (e) {
-      logThrottled('naver-live', '[Naver] 실시간 폴링 실패:', e?.message || e);
     } finally {
       busy = false;
     }
