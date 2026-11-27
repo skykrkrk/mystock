@@ -275,6 +275,8 @@ body.hide-closed .card.closed { display: none; }
 .top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 2px; }
 .name { font-size: 13px; font-weight: 600; color: #f0f3fa; }
 .ticker { font-size: 10px; color: #787b86; margin-left: 4px; }
+.price-wrap { display: flex; align-items: baseline; gap: 5px; }
+.last-time { font-size: 9px; font-weight: 400; color: #787b86; }
 .price { font-size: 13px; font-weight: 700; }
 .sub { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; font-size: 11px; }
 .badge { font-size: 9px; padding: 1px 4px; border-radius: 3px; background: #1e222d; color: #848e9c; }
@@ -341,6 +343,7 @@ function fmt(v) {
 }
 
 function updateHeader(ctx, price) {
+  ctx.timeEl.textContent = ctx.lastTime ? kstTime.format(new Date(ctx.lastTime * 1000)) : '';
   ctx.priceEl.textContent = fmt(price);
   if (!ctx.prevClose || !price) return;
   const diff = price - ctx.prevClose;
@@ -398,8 +401,16 @@ async function init() {
     priceSpan.className = 'price flat';
     priceSpan.textContent = '-';
 
+    const timeSpan = document.createElement('span');
+    timeSpan.className = 'last-time';
+
+    const priceWrap = document.createElement('div');
+    priceWrap.className = 'price-wrap';
+    priceWrap.appendChild(timeSpan);
+    priceWrap.appendChild(priceSpan);
+
     top.appendChild(titleBox);
-    top.appendChild(priceSpan);
+    top.appendChild(priceWrap);
 
     const sub = document.createElement('div');
     sub.className = 'sub';
@@ -443,6 +454,7 @@ async function init() {
 
     cards.set(item.id, {
       item, chart, series, card, badge, prevClose: 0, lastTime: 0, prevLine: null,
+      timeEl: timeSpan,
       priceEl: priceSpan,
       pctEl: pctSpan
     });
