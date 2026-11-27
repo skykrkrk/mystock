@@ -615,7 +615,9 @@ function connectWs(seq, interval) {
     if (msg.point.time >= ctx.lastTime) {
       ctx.series.update(msg.point);
       ctx.lastTime = msg.point.time;
-      if (ctx.item.source !== 'yahoo') updateHeader(ctx, msg.point.value, msg.point.time);
+      if (ctx.item.source !== 'yahoo' && ctx.item.source !== 'hl') {
+        updateHeader(ctx, msg.point.value, msg.point.time);
+      }
     }
   };
   sock.onerror = () => {};                              // close 이벤트에서 재연결 처리
@@ -710,8 +712,21 @@ function connectHL(feed) {
       return;
     }
     const value = parseFloat(c.c);
-    if (!Number.isFinite(value)) return;
-    broadcast(feed, { id: target.id, point: { time: Math.floor(c.t / 1000), value } });
+    const candleStart = Number(c.t);
+    const candleEnd = Number(c.T);
+    if (!Number.isFinite(value) || !Number.isFinite(candleStart)) return;
+    broadcast(feed, {
+      id: target.id,
+      point: { time: Math.floor(candleStart / 1000), value },
+    });
+
+    const now = Date.now();
+    if (Number.isFinite(candleEnd) && now <= candleEnd) {
+      broadcast(feed, {
+        id: target.id,
+        quote: { time: Math.floor(now / 1000), value },
+      });
+    }
   });
 
   hlWs.on('error', (e) => logThrottled('hl-error', '[HL] ws error:', e.message));
