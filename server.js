@@ -137,7 +137,7 @@ function getIntervalBucketTime(date, interval) {
 }
 
 // ───────────────────────── Yahoo quote 스냅샷 (기준가 / 장외가격 / 장상태) ─────────────────────────
-const yahooSnapshot = new Map();   // symbol -> { state, open, close, previousClose, hasExt, price, time }
+const yahooSnapshot = new Map();   // symbol -> { state, open, regularClose, previousClose, hasExt, price, time }
 let yahooSnapshotAt = 0;
 let yahooSnapshotPromise = null;
 
@@ -157,7 +157,7 @@ function summarizeYahooQuote(q) {
   return {
     state,
     open: positiveNumber(q.regularMarketOpen),
-    close: fullDayPrice,
+    regularClose: fullDayPrice,
     previousClose,
     hasExt,
     price: hasExt ? extPrice : q.regularMarketPrice,
@@ -524,10 +524,10 @@ app.get('/api/history', async (req, res) => {
     const usePfsymbol = Boolean(item.pfsymbol && !isOpen);
     const cacheKey = id + '|' + days + '|' + (usePfsymbol ? 'hl' : 'regular');
     const base = await cached(cacheKey, HISTORY_TTL_MS, () => loadBaseHistory(item, days, usePfsymbol));
-    // 기준가 재료: 시작가(open) / 정규장 종가(close) / 장외가격 존재 여부(ext). 어떤 값을 쓸지는 클라이언트가 장 상태로 고른다.
+    // 기준가 재료: 시작가(open) / Yahoo 정규장 가격(regularClose) / 장외가격 존재 여부(ext).
     let info = {
       open: base.open || 0,
-      close: base.close || 0,
+      regularClose: base.close || 0,
       previousClose: base.prevClose || 0,
       ext: false,
       regular: isOpen,
@@ -537,7 +537,7 @@ app.get('/api/history', async (req, res) => {
       if (snap) {
         info = {
           open: snap.open || info.open,
-          close: snap.close || info.close,
+          regularClose: snap.regularClose || info.regularClose,
           previousClose: snap.previousClose || info.previousClose,
           ext: snap.hasExt,
           regular: isOpen,
@@ -713,12 +713,12 @@ function getReferencePrice(ctx) {
     ? base.previousClose
     : ctx.previousClose;
   if (!isRegular && ctx.item.pfsymbol &&
-      Number.isFinite(base?.close) && base.close > 0) {
-    return base.close;
+      Number.isFinite(base?.regularClose) && base.regularClose > 0) {
+    return base.regularClose;
   }
   if (!isRegular && ctx.item.source === 'yahoo' && base?.ext &&
-      Number.isFinite(base.close) && base.close > 0) {
-    return base.close;
+      Number.isFinite(base.regularClose) && base.regularClose > 0) {
+    return base.regularClose;
   }
   return previousClose;
 }
@@ -1136,7 +1136,7 @@ function startYahooQuotePoller(feed) {
             quote: { time: Math.floor(snap.time / 1000), value: snap.price },
             base: {
               open: snap.open,
-              close: snap.close,
+              regularClose: snap.regularClose,
               previousClose: snap.previousClose,
               ext: snap.hasExt,
               regular: isOpen,
