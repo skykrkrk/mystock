@@ -121,6 +121,13 @@ function isMarketOpen(market, now = new Date()) {
   return true;                                        // 24H
 }
 
+function getIntervalBucketTime(date, interval) {
+  const timestamp = new Date(date).getTime();
+  const intervalMs = Number.parseInt(interval, 10) * 60 * 1000;
+  if (!Number.isFinite(timestamp) || !Number.isFinite(intervalMs) || intervalMs <= 0) return NaN;
+  return Math.floor(timestamp / intervalMs) * intervalMs / 1000;
+}
+
 // ───────────────────────── 히스토리 캐시 ─────────────────────────
 const historyCache = new Map();
 function cached(key, ttlMs, loader) {
@@ -284,14 +291,21 @@ async function loadHistory(item, interval, days) {
   const quotes = Array.isArray(result.quotes) ? result.quotes : [];
   const tz = item.market === 'KR' ? 'Asia/Seoul' : 'America/New_York';
 
-  const valid = quotes
+  const bucketed = quotes
     .filter(q => q.close !== null && q.close !== undefined)
-    .map(q => ({
-      time: Math.floor(new Date(q.date).getTime() / 1000),
-      value: q.close,
-      dayStr: new Date(q.date).toLocaleDateString('en-CA', { timeZone: tz }),
-    }))
+    .map(q => {
+      const date = new Date(q.date);
+      return {
+        time: getIntervalBucketTime(date, interval),
+        value: q.close,
+        dayStr: date.toLocaleDateString('en-CA', { timeZone: tz }),
+      };
+    })
+    .filter(point => Number.isFinite(point.time))
     .sort((a, b) => a.time - b.time);
+  const pointsByTime = new Map();
+  for (const point of bucketed) pointsByTime.set(point.time, point);
+  const valid = Array.from(pointsByTime.values());
 
   if (valid.length === 0) return { points: [], prevClose: 0 };
 
@@ -760,10 +774,10 @@ function startYahooChartPoller(feed) {
       const valid = quotes.filter(q => q.close !== null && q.close !== undefined);
       if (valid.length > 0 && !feed.closed) {
         const latest = valid[valid.length - 1];
-        broadcast(feed, {
-          id: item.id,
-          point: { time: Math.floor(new Date(latest.date).getTime() / 1000), value: latest.close },
-        });
+        const time = getIntervalBucketTime(latest.date, feed.interval);
+        if (Number.isFinite(time)) {
+          broadcast(feed, { id: item.id, point: { time, value: latest.close } });
+        }
       }
     } catch (e) {
       logThrottled('yahoo-live:' + item.id, '[Yahoo] ' + item.id + ' 폴링 실패:', e?.message || e);
