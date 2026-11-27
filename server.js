@@ -50,20 +50,20 @@ const wss = new WebSocketServer({
 const SYMBOLS = [
   { id: 'KS11',  symbol: 'KOSPI',     name: '코스피',     market: 'KR',   source: 'naver' },
   { id: 'KQ11',  symbol: 'KOSDAQ',    name: '코스닥',     market: 'KR',   source: 'naver' },
-  { id: 'KS200', symbol: 'KPI200',    name: '코스피200',  market: 'KR',   source: 'naver', pfsymbol: "xyz:KR200" },
+  { id: 'KS200', symbol: 'KPI200',    name: '코스피200',  market: 'KR',   source: 'naver', pfsymbol: 'xyz:KR200' },
   { id: 'KRW',   symbol: 'KRW=X',     name: '원달러환율',  market: 'FX24', source: 'yahoo' },
   { id: 'DXY',   symbol: 'DX-Y.NYB',  name: 'USD Index',  market: 'FX24', source: 'yahoo' },
-  { id: 'BZF',   symbol: 'BZ=F',      name: 'Brent Oil',  market: 'FX24', source: 'yahoo', pfsymbol: "xyz:BRENTOIL" },
+  { id: 'BZF',   symbol: 'BZ=F',      name: 'Brent Oil',  market: 'FX24', source: 'yahoo', pfsymbol: 'xyz:BRENTOIL' },
   { id: 'BTC',   symbol: 'BTC',       name: 'Bitcoin',    market: '24H',  source: 'hl' },
   { id: 'VIX',   symbol: '^VIX',      name: 'VIX',        market: 'US',   source: 'yahoo' },
   { id: 'GSPC',  symbol: '^GSPC',     name: 'S&P 500',    market: 'US',   source: 'yahoo' },
-  { id: 'NDX',   symbol: '^NDX',      name: 'Nasdaq 100', market: 'US',   source: 'yahoo', pfsymbol: "xyz:NDX" },
-  { id: 'ANT',   symbol: 'ANT',       name: 'Anthropic',  market: 'US',   source: 'yahoo', pfsymbol: "xyz:ANT" },
-  { id: 'AAPL',  symbol: 'AAPL',      name: 'Apple',      market: 'US',   source: 'yahoo', pfsymbol: "xyz:AAPL" },
-  { id: 'GOOGL', symbol: 'GOOGL',     name: 'Google',     market: 'US',   source: 'yahoo', pfsymbol: "xyz:GOOGL" },
-  { id: 'NVDA',  symbol: 'NVDA',      name: 'NVIDIA',     market: 'US',   source: 'yahoo', pfsymbol: "xyz:NVDA" },
-  { id: 'SPCX',  symbol: 'SPCX',      name: 'SPCX',       market: 'US',   source: 'yahoo', pfsymbol: "xyz:SPCX" },
-  { id: 'SCHD',  symbol: 'SCHD',      name: 'SCHD',       market: 'US',   source: 'yahoo', pfsymbol: "xyz:SCHD" },
+  { id: 'NDX',   symbol: '^NDX',      name: 'Nasdaq 100', market: 'US',   source: 'yahoo', pfsymbol: 'xyz:XYZ100' },
+  { id: 'ANT',   symbol: 'ANT',       name: 'Anthropic',  market: 'US',   source: 'yahoo', pfsymbol: 'xyz:ANT' },
+  { id: 'AAPL',  symbol: 'AAPL',      name: 'Apple',      market: 'US',   source: 'yahoo', pfsymbol: 'xyz:AAPL' },
+  { id: 'GOOGL', symbol: 'GOOGL',     name: 'Google',     market: 'US',   source: 'yahoo', pfsymbol: 'xyz:GOOGL' },
+  { id: 'NVDA',  symbol: 'NVDA',      name: 'NVIDIA',     market: 'US',   source: 'yahoo', pfsymbol: 'xyz:NVDA' },
+  { id: 'SPCX',  symbol: 'SPCX',      name: 'SPCX',       market: 'US',   source: 'yahoo', pfsymbol: 'xyz:SPCX' },
+  { id: 'SCHD',  symbol: 'SCHD',      name: 'SCHD',       market: 'US',   source: 'yahoo' },
   { id: 'JEPI',  symbol: 'JEPI',      name: 'JEPI',       market: 'US',   source: 'yahoo' },
   { id: 'SPYM',  symbol: 'SPYM',      name: 'SPYM',       market: 'US',   source: 'yahoo' },
   { id: 'QQQM',  symbol: 'QQQM',      name: 'QQQM',       market: 'US',   source: 'yahoo' },
@@ -659,11 +659,11 @@ function fmt(v) {
 
 function getMarketBadge(item, isOpen) {
   if (isOpen) return item.market;
-  return item.pfsymbol || item.source === 'yahoo' ? 'PF' : '마감';
+  return item.pfsymbol && item.source === 'yahoo' ? 'PF' : '마감';
 }
 
 function isPfMarket(item, isOpen) {
-  return !isOpen && Boolean(item.pfsymbol || item.source === 'yahoo');
+  return !isOpen && Boolean(item.pfsymbol && item.source === 'yahoo');
 }
 
 function updateHeader(ctx, price, priceTime = ctx.lastTime) {
