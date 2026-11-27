@@ -23,6 +23,8 @@ const NAVER_REALTIME_URL = 'https://polling.finance.naver.com/api/realtime?query
 const NAVER_INDEX_CHART_URL = 'https://api.stock.naver.com/chart/domestic/index/';
 const INTERVALS = new Set(['1m', '5m', '15m']);
 const HISTORY_TTL_MS = 45_000;
+// 업스트림(히스토리/실시간)은 1분봉 하나만 쓰고, 5분/15분은 종가 기준으로 여기서 파생한다.
+const BASE_INTERVAL = '1m';
 
 const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 const app = express();
@@ -146,6 +148,20 @@ function getIntervalBucketTime(date, interval) {
   return Math.floor(timestamp / intervalMs) * intervalMs / 1000;
 }
 
+// 1분봉 → N분봉. 차트가 종가만 쓰므로 각 구간의 마지막 값을 쓴다. 입력은 시간 오름차순.
+function bucketize(points, intervalMinutes) {
+  const step = intervalMinutes * 60;
+  if (!(step > 60)) return points;                    // 1분(또는 잘못된 값)은 그대로
+  const out = [];
+  for (const p of points) {
+    const time = Math.floor(p.time / step) * step;
+    const last = out[out.length - 1];
+    if (last && last.time === time) last.value = p.value;
+    else out.push({ time, value: p.value });
+  }
+  return out;
+}
+
 // ───────────────────────── 히스토리 캐시 ─────────────────────────
 const historyCache = new Map();
 function cached(key, ttlMs, loader) {
@@ -225,7 +241,9 @@ function parseNaverPrice(value) {
   return Number(value.replaceAll(',', '').trim());
 }
 
-async function loadHistory(item, interval, days) {
+// 1분봉 기준 히스토리(표시 구간 + 전일 종가). 5분/15분은 bucketize로 여기서 파생한다.
+async function loadBaseHistory(item, days) {
+  const interval = BASE_INTERVAL;
   if (item.source === 'hl') {
     const lookbackMs = (days === 1 ? 36 : 60) * 3600 * 1000;
     const arr = await fetchHLCandles(item, interval, Date.now() - lookbackMs, Date.now());
@@ -246,9 +264,17 @@ async function loadHistory(item, interval, days) {
     const startCut = days === 1 ? utcMidnightToday : utcMidnightYesterday;
     const displayPoints = points.filter(p => p.time >= startCut);
 
+    // 시작가: 오늘(UTC) 첫 캔들의 시가. 아직 오늘 캔들이 없으면 전일 종가로 대체
+    const todayFirst = arr
+      .filter(c => Number(c.t) >= utcMidnightToday * 1000)
+      .sort((a, b) => a.t - b.t)[0];
+    const openRaw = todayFirst ? parseFloat(todayFirst.o) : NaN;
+    const shown = displayPoints.length > 0 ? displayPoints : points.slice(-1440);   // 1분봉 24시간치
     return {
-      points: displayPoints.length > 0 ? displayPoints : points.slice(-96),
+      points: shown,
       prevClose,
+      open: Number.isFinite(openRaw) && openRaw > 0 ? openRaw : prevClose,
+      close: shown[shown.length - 1].value,
     };
   }
 
@@ -274,6 +300,7 @@ async function loadHistory(item, interval, days) {
         return {
           time: bucketTime,
           value,
+          open: parseNaverPrice(row.openPrice),
           dayStr: day,
           bucket,
         };
@@ -299,11 +326,15 @@ async function loadHistory(item, interval, days) {
       ? previousDayPoints[previousDayPoints.length - 1].value
       : displayPoints[0].value;
 
-    return { points: displayPoints, prevClose };
+    // 시작가: 마지막 표시일 첫 분봉의 시가(없으면 그 분봉 값). 종가: 마지막 값
+    const lastDisplayDay = targetDays[targetDays.length - 1];
+    const firstOfDay = minutePoints.find(p => p.dayStr === lastDisplayDay);
+    const open = firstOfDay && firstOfDay.open > 0 ? firstOfDay.open : (firstOfDay ? firstOfDay.value : 0);
+    return { points: displayPoints, prevClose, open, close: displayPoints[displayPoints.length - 1].value };
   }
 
   // Yahoo: 1분봉은 최근 약 7일까지만 제공 → 6일로 제한
-  const lookbackDays = interval === '1m' ? 6 : 8;
+  const lookbackDays = 6;
   const period1 = new Date(Date.now() - lookbackDays * 24 * 3600 * 1000);
   const result = await yahooFinance.chart(item.symbol, { period1, interval });
   const quotes = Array.isArray(result.quotes) ? result.quotes : [];
@@ -316,6 +347,7 @@ async function loadHistory(item, interval, days) {
       return {
         time: getIntervalBucketTime(date, interval),
         value: q.close,
+        open: q.open,
         dayStr: date.toLocaleDateString('en-CA', { timeZone: tz }),
       };
     })
@@ -348,7 +380,51 @@ async function loadHistory(item, interval, days) {
     prevClose = result.meta?.chartPreviousClose || displayPoints[0].value;
   }
 
-  return { points: displayPoints, prevClose };
+  // 시작가: 마지막 날 첫 분봉의 시가(없으면 그 값). 종가: 마지막 값. (실제 응답에서는 아래 quote 스냅샷 값이 우선한다)
+  const lastDay = uniqueDays[uniqueDays.length - 1];
+  const firstOfDay = valid.find(v => v.dayStr === lastDay);
+  const open = firstOfDay && firstOfDay.open > 0 ? firstOfDay.open : (firstOfDay ? firstOfDay.value : 0);
+  return { points: displayPoints, prevClose, open, close: valid[valid.length - 1].value };
+}
+
+// ───────────────────────── Yahoo quote 스냅샷 (기준가 / 장외가격) ─────────────────────────
+// quote 한 번에 시작가(regularMarketOpen), 정규장 종가(regularMarketPrice), 장외 가격(pre/postMarketPrice)이 들어 있다.
+// 장외 가격은 marketState 가 REGULAR 가 아닐 때만 유효한 것으로 본다. 장외 가격이 없는 종목(지수, 환율 등)은 hasExt=false.
+const yahooSnapshot = new Map();   // symbol -> { state, open, close, hasExt, price, time }
+let yahooSnapshotAt = 0;
+let yahooSnapshotPromise = null;
+
+function positiveNumber(v) { return Number.isFinite(v) && v > 0 ? v : 0; }
+function toMillis(t) { return t instanceof Date ? t.getTime() : new Date(t).getTime(); }
+
+function summarizeYahooQuote(q) {
+  const state = typeof q.marketState === 'string' ? q.marketState : '';
+  const isPre = state === 'PRE' || state === 'PREPRE';
+  const extPrice = positiveNumber(isPre ? q.preMarketPrice : q.postMarketPrice);
+  const extTime = toMillis(isPre ? q.preMarketTime : q.postMarketTime);
+  const hasExt = state !== 'REGULAR' && extPrice > 0;
+  return {
+    state,
+    open: positiveNumber(q.regularMarketOpen),
+    close: positiveNumber(q.regularMarketPrice),
+    previousClose: positiveNumber(q.regularMarketPreviousClose),
+    hasExt,
+    price: hasExt ? extPrice : q.regularMarketPrice,       // 헤더에 보여줄 가격 (장외가격 우선)
+    time: hasExt && Number.isFinite(extTime) ? extTime : toMillis(q.regularMarketTime),
+  };
+}
+
+// 여러 호출(15초 폴러, 히스토리 요청)이 겹쳐도 quote 요청은 5초에 한 번만 나간다.
+function refreshYahooSnapshot() {
+  if (yahooSnapshotPromise) return yahooSnapshotPromise;
+  if (Date.now() - yahooSnapshotAt < 5_000) return Promise.resolve();
+  yahooSnapshotPromise = yahooFinance.quote(YAHOO_ITEMS.map(item => item.symbol))
+    .then((quotes) => {
+      for (const q of quotes) yahooSnapshot.set(q.symbol, summarizeYahooQuote(q));
+      yahooSnapshotAt = Date.now();
+    })
+    .finally(() => { yahooSnapshotPromise = null; });
+  return yahooSnapshotPromise;
 }
 
 // ───────────────────────── HTTP 라우트 ─────────────────────────
@@ -367,8 +443,32 @@ app.get('/api/history', async (req, res) => {
   if (!INTERVALS.has(interval)) return res.status(400).json({ error: 'Invalid interval' });
 
   try {
-    const data = await cached(id + '|' + interval + '|' + days, HISTORY_TTL_MS, () => loadHistory(item, interval, days));
-    return res.json(data);
+    // 1분봉 기준 히스토리를 종목/일수별로 한 번만 받아 캐시하고, 요청한 간격으로 묶어서 내려준다.
+    const base = await cached(id + '|' + days, HISTORY_TTL_MS, () => loadBaseHistory(item, days));
+    // 기준가 재료: 시작가(open) / 정규장 종가(close) / 장외가격 존재 여부(ext). 어떤 값을 쓸지는 클라이언트가 장 상태로 고른다.
+    let info = {
+      open: base.open || 0,
+      close: base.close || 0,
+      previousClose: base.prevClose || 0,
+      ext: false,
+      regular: isMarketOpen(item.market),
+    };
+    if (item.source === 'yahoo') {
+      try { await refreshYahooSnapshot(); } catch (e) { logThrottled('yahoo-snapshot', '[Yahoo] quote 스냅샷 실패:', e?.message || e); }
+      const snap = yahooSnapshot.get(item.symbol);
+      if (snap) {
+        info = {
+          open: snap.open || info.open,
+          close: snap.close || info.close,
+          previousClose: snap.previousClose || info.previousClose,
+          ext: snap.hasExt,
+          regular: isMarketOpen(item.market),
+          price: snap.price,
+          time: Math.floor(snap.time / 1000),
+        };
+      }
+    }
+    return res.json({ points: bucketize(base.points, Number.parseInt(interval, 10)), prevClose: base.prevClose, base: info });
   } catch (err) {
     logThrottled('history:' + id, '[history] ' + id + ' 실패:', err?.message || err);
     return res.json({ points: [], prevClose: 0, error: true });
@@ -537,6 +637,8 @@ function fmt(v) {
 }
 
 function updateHeader(ctx, price, priceTime = ctx.lastTime) {
+  ctx.currentPrice = price;
+  ctx.currentPriceTime = priceTime;
   ctx.timeEl.textContent = priceTime ? kstTime.format(new Date(priceTime * 1000)) : '';
   ctx.priceEl.textContent = fmt(price);
   if (!ctx.prevClose || !price) return;
@@ -551,10 +653,46 @@ function updateHeader(ctx, price, priceTime = ctx.lastTime) {
   ctx.series.applyOptions({ lineColor: color, topColor: color + '33', bottomColor: color + '00' });
 }
 
+function getReferencePrice(ctx) {
+  const base = ctx.yahooBase;
+  const isRegular = typeof base?.regular === 'boolean' ? base.regular : ctx.isOpen;
+  const previousClose = Number.isFinite(base?.previousClose) && base.previousClose > 0
+    ? base.previousClose
+    : ctx.previousClose;
+  if (ctx.item.market === 'US' && !isRegular && base?.ext &&
+      Number.isFinite(base.close) && base.close > 0) {
+    return base.close;
+  }
+  return previousClose;
+}
+
+function setReferencePrice(ctx, price) {
+  const nextPrice = Number.isFinite(price) && price > 0 ? price : 0;
+  if (ctx.prevClose === nextPrice && (nextPrice === 0 || ctx.prevLine)) return;
+  if (ctx.prevLine) {
+    ctx.series.removePriceLine(ctx.prevLine);
+    ctx.prevLine = null;
+  }
+  ctx.prevClose = nextPrice;
+  if (nextPrice > 0) {
+    ctx.prevLine = ctx.series.createPriceLine({
+      price: nextPrice, color: '#6b7280', lineWidth: 1, lineStyle: 2,
+      axisLabelVisible: true, title: '',
+    });
+  }
+  if (ctx.currentPrice > 0) updateHeader(ctx, ctx.currentPrice, ctx.currentPriceTime);
+}
+
 function applyStatus(ctx, isOpen, market) {
+  const changed = ctx.isOpen !== isOpen;
+  ctx.isOpen = isOpen;
   ctx.card.classList.toggle('closed', !isOpen);
   ctx.badge.classList.toggle('open', isOpen);
   ctx.badge.textContent = isOpen ? market : '마감';
+  if (changed && ctx.yahooBase) {
+    ctx.yahooBase.regular = isOpen;
+    setReferencePrice(ctx, getReferencePrice(ctx));
+  }
 }
 
 async function refreshStatus() {
@@ -650,7 +788,9 @@ async function init() {
     chEl.appendChild(markerLayer);
 
     const ctx = {
-      item, chart, series, card, badge, prevClose: 0, lastTime: 0, prevLine: null,
+      item, chart, series, card, badge, prevClose: 0, previousClose: 0,
+      currentPrice: 0, currentPriceTime: 0, isOpen: item.isOpen, yahooBase: null,
+      lastTime: 0, prevLine: null,
       chartEl: chEl, markerLayer, sessionDays: new Set(), timeEl: timeSpan,
       priceEl: priceSpan,
       pctEl: pctSpan
@@ -681,15 +821,17 @@ async function loadOne(id, ctx, interval, days, seq, attempt = 0) {
         if (seq === loadSeq) loadOne(id, ctx, interval, days, seq, attempt + 1);   // 낡은 요청이면 재시도 안 함
       }, 2000 * (attempt + 1));
     }
-    ctx.prevClose = data.prevClose || 0;
+    ctx.previousClose = data.prevClose || 0;
+    ctx.yahooBase = data.base || null;
+    if (Number.isFinite(ctx.yahooBase?.previousClose) && ctx.yahooBase.previousClose > 0) {
+      ctx.previousClose = ctx.yahooBase.previousClose;
+    }
+    if (typeof ctx.yahooBase?.regular === 'boolean') ctx.isOpen = ctx.yahooBase.regular;
+    setReferencePrice(ctx, getReferencePrice(ctx));
     const closeSettings = getSessionCloseSettings(ctx.item.market);
     ctx.sessionDays = new Set(closeSettings
       ? points.map(point => getZonedDateParts(new Date(point.time * 1000), closeSettings.timeZone).date)
       : []);
-    if (ctx.prevLine) { ctx.series.removePriceLine(ctx.prevLine); ctx.prevLine = null; }
-    if (ctx.prevClose > 0) {
-      ctx.prevLine = ctx.series.createPriceLine({ price: ctx.prevClose, color: '#6b7280', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '' });
-    }
     ctx.series.setData(points);                        // 빈 배열이면 이전 간격의 잔상도 지움
     ctx.lastTime = 0;
     positionSessionCloseMarkers(ctx);
@@ -723,24 +865,37 @@ function connectWs(seq, interval) {
 
   sock.onopen = () => {
     retryCount = 0;
-    sock.send(JSON.stringify({ action: 'subscribeAll', interval }));
+    sock.send(JSON.stringify({ action: 'subscribeAll' }));
   };
   sock.onmessage = (e) => {
     let msg;
     try { msg = JSON.parse(e.data); } catch (err) { return; }
     const ctx = cards.get(msg.id);
     if (!ctx) return;
+    if (msg.base) {
+      ctx.yahooBase = msg.base;
+      if (Number.isFinite(msg.base.previousClose) && msg.base.previousClose > 0) {
+        ctx.previousClose = msg.base.previousClose;
+      }
+      if (typeof msg.base.regular === 'boolean') ctx.isOpen = msg.base.regular;
+      setReferencePrice(ctx, getReferencePrice(ctx));
+    }
     // 한 메시지에 quote(헤더용)와 point(차트용)가 함께 올 수 있으므로 둘 다 처리한다.
     if (msg.quote && Number.isFinite(msg.quote.value) && Number.isFinite(msg.quote.time)) {
       updateHeader(ctx, msg.quote.value, msg.quote.time);
     }
-    if (msg.point && msg.point.time >= ctx.lastTime) {
-      ctx.series.update(msg.point);
-      ctx.lastTime = msg.point.time;
-      const closeSettings = getSessionCloseSettings(ctx.item.market);
-      if (closeSettings) {
-        ctx.sessionDays.add(getZonedDateParts(new Date(msg.point.time * 1000), closeSettings.timeZone).date);
-        positionSessionCloseMarkers(ctx);
+    if (msg.point && Number.isFinite(msg.point.time) && Number.isFinite(msg.point.value)) {
+      // 서버는 1분 단위 포인트를 보낸다. 선택한 간격(5분/15분)의 구간 시작 시각으로 묶어서 반영한다.
+      const step = Number.parseInt(interval, 10) * 60;
+      const bucketTime = Math.floor(msg.point.time / step) * step;
+      if (bucketTime >= ctx.lastTime) {
+        ctx.series.update({ time: bucketTime, value: msg.point.value });
+        ctx.lastTime = bucketTime;
+        const closeSettings = getSessionCloseSettings(ctx.item.market);
+        if (closeSettings) {
+          ctx.sessionDays.add(getZonedDateParts(new Date(bucketTime * 1000), closeSettings.timeZone).date);
+          positionSessionCloseMarkers(ctx);
+        }
       }
     }
   };
@@ -787,8 +942,9 @@ app.get('/', (req, res) => {
   res.send(htmlContent);
 });
 
-// ───────────────────────── 업스트림 피드 (간격별 1세트 공유) ─────────────────────────
-// 접속자가 몇 명이든 간격(1m/5m/15m)마다 HL 소켓 1개 + Yahoo 폴러 1개만 유지한다.
+// ───────────────────────── 업스트림 피드 (1분봉 1세트 공유) ─────────────────────────
+// 접속자가 몇 명이든, 어떤 간격을 보든 HL 소켓 1개 + Yahoo/Naver 폴러 1세트만 유지한다.
+// 서버는 1분 단위 포인트만 보내고, 5분/15분으로 묶는 일은 클라이언트가 한다.
 const feeds = new Map();
 
 function broadcast(feed, obj) {
@@ -874,7 +1030,7 @@ function startYahooChartPoller(feed) {
 
     busy = true;
     try {
-      const period1 = new Date(Date.now() - 24 * 3600 * 1000);
+      const period1 = new Date(Date.now() - 60 * 60 * 1000);   // 최신 1분봉만 필요하므로 최근 1시간만 조회
       const result = await yahooFinance.chart(item.symbol, { period1, interval: feed.interval });
       const quotes = Array.isArray(result.quotes) ? result.quotes : [];
       const valid = quotes.filter(q => q.close !== null && q.close !== undefined);
@@ -899,22 +1055,25 @@ function startYahooQuotePoller(feed) {
     if (busy || feed.closed) return;
     busy = true;
     try {
-      const quotes = await yahooFinance.quote(YAHOO_ITEMS.map(item => item.symbol));
-      const quotesBySymbol = new Map(quotes.map(quote => [quote.symbol, quote]));
+      await refreshYahooSnapshot();
       for (const item of YAHOO_ITEMS) {
-        const quote = quotesBySymbol.get(item.symbol);
-        const price = quote?.regularMarketPrice;
-        const time = quote?.regularMarketTime instanceof Date
-          ? quote.regularMarketTime.getTime()
-          : new Date(quote?.regularMarketTime).getTime();
-        if (!Number.isFinite(price) || !Number.isFinite(time)) {
+        const snap = yahooSnapshot.get(item.symbol);
+        if (!snap || !Number.isFinite(snap.price) || !Number.isFinite(snap.time)) {
           logThrottled('yahoo-quote:' + item.id, '[Yahoo] ' + item.id + ' quote 값 없음');
           continue;
         }
         if (!feed.closed) {
           broadcast(feed, {
             id: item.id,
-            quote: { time: Math.floor(time / 1000), value: price },
+            // 장외가격이 있으면 헤더 가격으로 쓰고, base 는 클라이언트가 기준선/등락률 기준을 고를 때 쓴다.
+            quote: { time: Math.floor(snap.time / 1000), value: snap.price },
+            base: {
+              open: snap.open,
+              close: snap.close,
+              previousClose: snap.previousClose,
+              ext: snap.hasExt,
+              regular: isMarketOpen(item.market),
+            },
           });
         }
       }
@@ -1030,9 +1189,9 @@ wss.on('connection', (clientWs) => {
   clientWs.on('message', (rawMsg) => {
     let msg;
     try { msg = JSON.parse(rawMsg); } catch { return; }
-    if (!msg || msg.action !== 'subscribeAll' || !INTERVALS.has(msg.interval)) return;
+    if (!msg || msg.action !== 'subscribeAll') return;
     detach(clientWs);
-    attach(clientWs, msg.interval);
+    attach(clientWs, BASE_INTERVAL);
   });
 
   clientWs.on('close', () => detach(clientWs));
