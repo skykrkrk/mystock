@@ -21,10 +21,10 @@ const HL_REST_URL = 'https://api.hyperliquid.xyz/info';
 const HL_WS_URL = 'wss://api.hyperliquid.xyz/ws';
 const NAVER_REALTIME_URL = 'https://polling.finance.naver.com/api/realtime?query=SERVICE_INDEX:';
 const NAVER_INDEX_CHART_URL = 'https://api.stock.naver.com/chart/domestic/index/';
-const INTERVALS = new Set(['1m', '5m', '15m']);
+const CHART_INTERVAL = '15m';
+const INTERVALS = new Set([CHART_INTERVAL]);
 const HISTORY_TTL_MS = 45_000;
-// 업스트림(히스토리/실시간)은 1분봉 하나만 쓰고, 5분/15분은 종가 기준으로 여기서 파생한다.
-const BASE_INTERVAL = '1m';
+// Naver index history is returned as minute rows and aggregated into 15-minute bars.
 
 const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 const app = express();
@@ -148,20 +148,6 @@ function getIntervalBucketTime(date, interval) {
   return Math.floor(timestamp / intervalMs) * intervalMs / 1000;
 }
 
-// 1분봉 → N분봉. 차트가 종가만 쓰므로 각 구간의 마지막 값을 쓴다. 입력은 시간 오름차순.
-function bucketize(points, intervalMinutes) {
-  const step = intervalMinutes * 60;
-  if (!(step > 60)) return points;                    // 1분(또는 잘못된 값)은 그대로
-  const out = [];
-  for (const p of points) {
-    const time = Math.floor(p.time / step) * step;
-    const last = out[out.length - 1];
-    if (last && last.time === time) last.value = p.value;
-    else out.push({ time, value: p.value });
-  }
-  return out;
-}
-
 // ───────────────────────── 히스토리 캐시 ─────────────────────────
 const historyCache = new Map();
 function cached(key, ttlMs, loader) {
@@ -241,9 +227,9 @@ function parseNaverPrice(value) {
   return Number(value.replaceAll(',', '').trim());
 }
 
-// 1분봉 기준 히스토리(표시 구간 + 전일 종가). 5분/15분은 bucketize로 여기서 파생한다.
+// 15분봉 기준 히스토리(표시 구간 + 전일 종가).
 async function loadBaseHistory(item, days) {
-  const interval = BASE_INTERVAL;
+  const interval = CHART_INTERVAL;
   if (item.source === 'hl') {
     const lookbackMs = (days === 1 ? 36 : 60) * 3600 * 1000;
     const arr = await fetchHLCandles(item, interval, Date.now() - lookbackMs, Date.now());
@@ -269,7 +255,7 @@ async function loadBaseHistory(item, days) {
       .filter(c => Number(c.t) >= utcMidnightToday * 1000)
       .sort((a, b) => a.t - b.t)[0];
     const openRaw = todayFirst ? parseFloat(todayFirst.o) : NaN;
-    const shown = displayPoints.length > 0 ? displayPoints : points.slice(-1440);   // 1분봉 24시간치
+    const shown = displayPoints.length > 0 ? displayPoints : points.slice(-96);   // 15분봉 24시간치
     return {
       points: shown,
       prevClose,
@@ -333,7 +319,7 @@ async function loadBaseHistory(item, days) {
     return { points: displayPoints, prevClose, open, close: displayPoints[displayPoints.length - 1].value };
   }
 
-  // Yahoo: 1분봉은 최근 약 7일까지만 제공 → 6일로 제한
+  // 최근 거래일과 전일 종가를 포함하도록 Yahoo 15분봉을 6일 조회한다.
   const lookbackDays = 6;
   const period1 = new Date(Date.now() - lookbackDays * 24 * 3600 * 1000);
   const result = await yahooFinance.chart(item.symbol, { period1, interval });
@@ -443,7 +429,7 @@ app.get('/api/history', async (req, res) => {
   if (!INTERVALS.has(interval)) return res.status(400).json({ error: 'Invalid interval' });
 
   try {
-    // 1분봉 기준 히스토리를 종목/일수별로 한 번만 받아 캐시하고, 요청한 간격으로 묶어서 내려준다.
+    // 15분봉 히스토리는 종목/일수별로 캐시하고 그대로 반환한다.
     const base = await cached(id + '|' + days, HISTORY_TTL_MS, () => loadBaseHistory(item, days));
     // 기준가 재료: 시작가(open) / 정규장 종가(close) / 장외가격 존재 여부(ext). 어떤 값을 쓸지는 클라이언트가 장 상태로 고른다.
     let info = {
@@ -468,7 +454,7 @@ app.get('/api/history', async (req, res) => {
         };
       }
     }
-    return res.json({ points: bucketize(base.points, Number.parseInt(interval, 10)), prevClose: base.prevClose, base: info });
+    return res.json({ points: base.points, prevClose: base.prevClose, base: info });
   } catch (err) {
     logThrottled('history:' + id, '[history] ' + id + ' 실패:', err?.message || err);
     return res.json({ points: [], prevClose: 0, error: true });
@@ -490,6 +476,7 @@ header { position: sticky; top: 0; z-index: 100; display: flex; justify-content:
 .controls { display: flex; gap: 10px; align-items: center; font-size: 12px; }
 label { display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
 select { padding: 4px 8px; background: #1e222d; color: #fff; border: 1px solid #323746; border-radius: 4px; font-size: 12px; }
+.timeframe { padding: 4px 8px; background: #1e222d; color: #fff; border: 1px solid #323746; border-radius: 4px; font-size: 12px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; padding: 10px; }
 .card { background: #131722; border: 1px solid #222631; border-radius: 6px; padding: 8px 10px 6px; display: flex; flex-direction: column; }
 .card.closed { opacity: 0.55; }
@@ -520,11 +507,7 @@ body.hide-closed .card.closed { display: none; }
       <option value="1">1일</option>
       <option value="2" selected>2일</option>
     </select>
-    <select id="interval">
-      <option value="1m">1분</option>
-      <option value="5m">5분</option>
-      <option value="15m" selected>15분</option>
-    </select>
+    <span class="timeframe">15분봉</span>
   </div>
 </header>
 <div class="grid" id="grid"></div>
@@ -533,7 +516,6 @@ import { createChart, AreaSeries } from '/chart-lib.js?v=5';
 
 const gridEl = document.getElementById('grid');
 const daysEl = document.getElementById('days');
-const intervalEl = document.getElementById('interval');
 const filterOpenEl = document.getElementById('filterOpen');
 const headerTitleEl = document.getElementById('headerTitle');
 const cards = new Map();
@@ -542,6 +524,7 @@ const UP_COLOR = '#26a63a';
 const DOWN_COLOR = '#ef5350';
 const FLAT_COLOR = '#848e9c';
 const CONCURRENCY = 4;
+const CHART_INTERVAL = '15m';
 
 let loadSeq = 0;
 let ws = null;
@@ -602,7 +585,7 @@ function positionSessionCloseMarkers(ctx) {
   if (!range) return;
   const from = Number(range.from);
   const to = Number(range.to);
-  const intervalSeconds = Number.parseInt(intervalEl.value, 10) * 60;
+  const intervalSeconds = Number.parseInt(CHART_INTERVAL, 10) * 60;
 
   for (const date of ctx.sessionDays) {
     const closeTime = getZonedCloseTime(date, settings.timeZone, settings.closeMinutes);
@@ -805,9 +788,9 @@ async function init() {
   await loadAll();
 }
 
-async function loadOne(id, ctx, interval, days, seq, attempt = 0) {
+async function loadOne(id, ctx, days, seq, attempt = 0) {
   try {
-    const res = await fetch('/api/history?id=' + encodeURIComponent(id) + '&interval=' + interval + '&days=' + days);
+    const res = await fetch('/api/history?id=' + encodeURIComponent(id) + '&interval=' + CHART_INTERVAL + '&days=' + days);
     const data = await res.json();
     if (seq !== loadSeq) return;                       // 더 새로운 요청이 있으면 버림
 
@@ -818,7 +801,7 @@ async function loadOne(id, ctx, interval, days, seq, attempt = 0) {
       (ctx.item.source === 'naver' && points.length === 0);
     if (needRetry && attempt < 3) {
       setTimeout(() => {
-        if (seq === loadSeq) loadOne(id, ctx, interval, days, seq, attempt + 1);   // 낡은 요청이면 재시도 안 함
+        if (seq === loadSeq) loadOne(id, ctx, days, seq, attempt + 1);   // 낡은 요청이면 재시도 안 함
       }, 2000 * (attempt + 1));
     }
     ctx.previousClose = data.prevClose || 0;
@@ -857,7 +840,7 @@ function closeWs() {
   }
 }
 
-function connectWs(seq, interval) {
+function connectWs(seq) {
   if (seq !== loadSeq) return;
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const sock = new WebSocket(protocol + '//' + location.host + '/ws');
@@ -885,15 +868,12 @@ function connectWs(seq, interval) {
       updateHeader(ctx, msg.quote.value, msg.quote.time);
     }
     if (msg.point && Number.isFinite(msg.point.time) && Number.isFinite(msg.point.value)) {
-      // 서버는 1분 단위 포인트를 보낸다. 선택한 간격(5분/15분)의 구간 시작 시각으로 묶어서 반영한다.
-      const step = Number.parseInt(interval, 10) * 60;
-      const bucketTime = Math.floor(msg.point.time / step) * step;
-      if (bucketTime >= ctx.lastTime) {
-        ctx.series.update({ time: bucketTime, value: msg.point.value });
-        ctx.lastTime = bucketTime;
+      if (msg.point.time >= ctx.lastTime) {
+        ctx.series.update(msg.point);
+        ctx.lastTime = msg.point.time;
         const closeSettings = getSessionCloseSettings(ctx.item.market);
         if (closeSettings) {
-          ctx.sessionDays.add(getZonedDateParts(new Date(bucketTime * 1000), closeSettings.timeZone).date);
+          ctx.sessionDays.add(getZonedDateParts(new Date(msg.point.time * 1000), closeSettings.timeZone).date);
           positionSessionCloseMarkers(ctx);
         }
       }
@@ -903,13 +883,12 @@ function connectWs(seq, interval) {
   sock.onclose = () => {
     if (seq !== loadSeq || ws !== sock) return;
     const delay = Math.min(1000 * Math.pow(2, retryCount++), 15000);
-    retryTimer = setTimeout(() => connectWs(seq, interval), delay);
+    retryTimer = setTimeout(() => connectWs(seq), delay);
   };
 }
 
 async function loadAll() {
   const seq = ++loadSeq;
-  const interval = intervalEl.value;
   const days = daysEl.value;
   headerTitleEl.textContent = '시장 모니터 (' + days + '일)';
   closeWs();
@@ -920,18 +899,17 @@ async function loadAll() {
     while (next < queue.length) {
       if (seq !== loadSeq) return;
       const entry = queue[next++];
-      await loadOne(entry[0], entry[1], interval, days, seq);
+      await loadOne(entry[0], entry[1], days, seq);
     }
   };
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
   if (seq !== loadSeq) return;
   retryCount = 0;
-  connectWs(seq, interval);
+  connectWs(seq);
 }
 
 daysEl.addEventListener('change', loadAll);
-intervalEl.addEventListener('change', loadAll);
 init().catch((e) => console.error('init failed', e));
 </script>
 </body>
@@ -942,9 +920,8 @@ app.get('/', (req, res) => {
   res.send(htmlContent);
 });
 
-// ───────────────────────── 업스트림 피드 (1분봉 1세트 공유) ─────────────────────────
-// 접속자가 몇 명이든, 어떤 간격을 보든 HL 소켓 1개 + Yahoo/Naver 폴러 1세트만 유지한다.
-// 서버는 1분 단위 포인트만 보내고, 5분/15분으로 묶는 일은 클라이언트가 한다.
+// ───────────────────────── 업스트림 피드 (15분봉 1세트 공유) ─────────────────────────
+// 접속자가 몇 명이든 15분봉 HL 소켓과 Yahoo/Naver 폴러를 한 세트만 유지한다.
 const feeds = new Map();
 
 function broadcast(feed, obj) {
@@ -1030,7 +1007,7 @@ function startYahooChartPoller(feed) {
 
     busy = true;
     try {
-      const period1 = new Date(Date.now() - 60 * 60 * 1000);   // 최신 1분봉만 필요하므로 최근 1시간만 조회
+      const period1 = new Date(Date.now() - 60 * 60 * 1000);   // 최신 15분봉 확인용
       const result = await yahooFinance.chart(item.symbol, { period1, interval: feed.interval });
       const quotes = Array.isArray(result.quotes) ? result.quotes : [];
       const valid = quotes.filter(q => q.close !== null && q.close !== undefined);
@@ -1191,7 +1168,7 @@ wss.on('connection', (clientWs) => {
     try { msg = JSON.parse(rawMsg); } catch { return; }
     if (!msg || msg.action !== 'subscribeAll') return;
     detach(clientWs);
-    attach(clientWs, BASE_INTERVAL);
+    attach(clientWs, CHART_INTERVAL);
   });
 
   clientWs.on('close', () => detach(clientWs));
