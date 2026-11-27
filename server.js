@@ -95,50 +95,29 @@ function logThrottled(key, ...args) {
 
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
 
-// ───────────────────────── 장 시간 ─────────────────────────
-// 휴장일 목록은 2026년분만 들어 있음 → 연말에 갱신 필요.
-// 한국 휴장일은 직접 확인 후 사용 권장 (임시공휴일/대체공휴일 변동 가능).
-const US_HOLIDAYS = new Set([ // 날짜는 미국 동부(ET) 기준
-  '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25',
-  '2026-06-19', '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25',
-]);
-const US_EARLY_CLOSE = new Set([ // 13:00 ET 조기 폐장 (추수감사절 다음 날, 크리스마스 이브)
-  '2026-11-27', '2026-12-24',
-]);
-const KR_HOLIDAYS = new Set([ // 날짜는 KST 기준 (주말은 따로 처리)
-  '2026-01-01', '2026-02-16', '2026-02-17', '2026-02-18', '2026-03-02',
-  '2026-05-01', '2026-05-05', '2026-05-25', '2026-06-03', '2026-08-17',
-  '2026-09-24', '2026-09-25', '2026-09-26', '2026-10-05', '2026-10-09',
-  '2026-12-25', '2026-12-31',
-]);
-
+// ───────────────────────── 장 시간 및 상태 판별 ─────────────────────────
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 function zonedParts(date, timeZone) {
   const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', weekday: 'short', hour12: false,
+    timeZone, hour: '2-digit', minute: '2-digit', weekday: 'short', hour12: false,
   }).formatToParts(date);
   const p = Object.fromEntries(parts.map(x => [x.type, x.value]));
   return {
-    dateStr: p.year + '-' + p.month + '-' + p.day,
     dow: WEEKDAYS.indexOf(p.weekday),
     mins: (Number(p.hour) % 24) * 60 + Number(p.minute),
   };
 }
 
-function isMarketOpen(market, now = new Date()) {
+function isMarketOpenByClock(market, now = new Date()) {
   if (market === 'KR') {
     const z = zonedParts(now, 'Asia/Seoul');
     if (z.dow === 0 || z.dow === 6) return false;
-    if (KR_HOLIDAYS.has(z.dateStr)) return false;
-    return z.mins >= 530 && z.mins <= 940;            // 08:50 ~ 15:40 (여유 포함)
+    return z.mins >= 540 && z.mins < 930;             // 09:00 ~ 15:30 정규장
   }
   if (market === 'US') {
     const z = zonedParts(now, 'America/New_York');    // 서머타임 자동 반영
     if (z.dow === 0 || z.dow === 6) return false;
-    if (US_HOLIDAYS.has(z.dateStr)) return false;
-    const closeMins = US_EARLY_CLOSE.has(z.dateStr) ? 13 * 60 : 16 * 60;
-    return z.mins >= 570 && z.mins < closeMins;       // 09:30 ~ 16:00 ET 정규장 (조기 폐장일은 13:00)
+    return z.mins >= 570 && z.mins < 16 * 60;         // 09:30 ~ 16:00 ET 정규장
   }
   if (market === 'FX24') {                            // 금 17:00 ET ~ 일 17:00 ET 휴장
     const z = zonedParts(now, 'America/New_York');
@@ -155,6 +134,62 @@ function getIntervalBucketTime(date, interval) {
   const intervalMs = Number.parseInt(interval, 10) * 60 * 1000;
   if (!Number.isFinite(timestamp) || !Number.isFinite(intervalMs) || intervalMs <= 0) return NaN;
   return Math.floor(timestamp / intervalMs) * intervalMs / 1000;
+}
+
+// ───────────────────────── Yahoo quote 스냅샷 (기준가 / 장외가격 / 장상태) ─────────────────────────
+const yahooSnapshot = new Map();   // symbol -> { state, open, close, previousClose, hasExt, price, time }
+let yahooSnapshotAt = 0;
+let yahooSnapshotPromise = null;
+
+function positiveNumber(v) { return Number.isFinite(v) && v > 0 ? v : 0; }
+function toMillis(t) { return t instanceof Date ? t.getTime() : new Date(t).getTime(); }
+
+function summarizeYahooQuote(q) {
+  const state = typeof q.marketState === 'string' ? q.marketState : '';
+  const isPre = state === 'PRE' || state === 'PREPRE';
+  const extPrice = positiveNumber(isPre ? q.preMarketPrice : q.postMarketPrice);
+  const extTime = toMillis(isPre ? q.preMarketTime : q.postMarketTime);
+  const hasExt = state !== 'REGULAR' && extPrice > 0;
+  const fullDayPrice = positiveNumber(q.regularMarketPrice);
+  const fullDayChange = Number.isFinite(q.regularMarketChange) ? q.regularMarketChange : NaN;
+  const previousClose = positiveNumber(fullDayPrice - fullDayChange) ||
+    positiveNumber(q.regularMarketPreviousClose);
+  return {
+    state,
+    open: positiveNumber(q.regularMarketOpen),
+    close: fullDayPrice,
+    previousClose,
+    hasExt,
+    price: hasExt ? extPrice : q.regularMarketPrice,
+    time: hasExt && Number.isFinite(extTime) ? extTime : toMillis(q.regularMarketTime),
+  };
+}
+
+function refreshYahooSnapshot() {
+  if (yahooSnapshotPromise) return yahooSnapshotPromise;
+  if (Date.now() - yahooSnapshotAt < 5_000) return Promise.resolve();
+  yahooSnapshotPromise = yahooFinance.quote(YAHOO_ITEMS.map(item => item.symbol))
+    .then((quotes) => {
+      for (const q of quotes) yahooSnapshot.set(q.symbol, summarizeYahooQuote(q));
+      yahooSnapshotAt = Date.now();
+    })
+    .finally(() => { yahooSnapshotPromise = null; });
+  return yahooSnapshotPromise;
+}
+
+function isRegularMarketOpen(item, now = new Date()) {
+  if (item.source === 'yahoo') {
+    const snap = yahooSnapshot.get(item.symbol);
+    if (snap && Date.now() - yahooSnapshotAt < 120_000 && snap.state) {
+      if (item.market === 'US') {
+        return snap.state === 'REGULAR';
+      }
+      if (item.market === 'FX24') {
+        return snap.state === 'REGULAR' || snap.state === 'PRE' || snap.state === 'POST';
+      }
+    }
+  }
+  return isMarketOpenByClock(item.market, now);
 }
 
 // ───────────────────────── 히스토리 캐시 ─────────────────────────
@@ -231,7 +266,7 @@ async function fetchNaverIndexHistory(code, startDate, endDate) {
 }
 
 async function fetchNaverLatestClose(code) {
-  const today = zonedParts(new Date(), 'Asia/Seoul').dateStr;
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });
   const [year, month, day] = today.split('-').map(Number);
   const startDate = new Date(Date.UTC(year, month - 1, day - 7))
     .toISOString().slice(0, 10).replaceAll('-', '');
@@ -252,24 +287,78 @@ function parseNaverPrice(value) {
   return Number(value.replaceAll(',', '').trim());
 }
 
-// 15분봉 기준 히스토리(표시 구간 + 전일 종가).
+function getNaverSessionCloses(rows) {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' }).replaceAll('-', '');
+  const closeByDate = new Map();
+  for (const row of rows) {
+    const stamp = row.localDateTime;
+    if (typeof stamp !== 'string' || !/^\d{14}$/.test(stamp)) continue;
+    const date = stamp.slice(0, 8);
+    if (date === today && isMarketOpenByClock('KR')) continue;
+    const closeTime = Date.UTC(
+      Number(stamp.slice(0, 4)), Number(stamp.slice(4, 6)) - 1, Number(stamp.slice(6, 8)),
+      Number(stamp.slice(8, 10)), Number(stamp.slice(10, 12)), Number(stamp.slice(12, 14))
+    ) / 1000 - 9 * 60 * 60;
+    closeByDate.set(date, Math.max(closeByDate.get(date) || 0, closeTime));
+  }
+  return Array.from(closeByDate.values()).sort((a, b) => a - b);
+}
+
+function getYahooSessionCloses(result) {
+  const periods = result.meta?.tradingPeriods;
+  const regular = Array.isArray(periods)
+    ? periods.flat(2)
+    : Array.isArray(periods?.regular) ? periods.regular.flat() : [];
+  const current = result.meta?.currentTradingPeriod?.regular;
+  if (current) regular.push(current);
+  return Array.from(new Set(regular
+    .map(period => period.end instanceof Date
+      ? Math.floor(period.end.getTime() / 1000)
+      : Number(period.end))
+    .filter(Number.isFinite)))
+    .sort((a, b) => a - b);
+}
+
+async function fetchYahooSessionCloses(symbol, period1) {
+  const result = await yahooFinance.chart(symbol, { period1, interval: CHART_INTERVAL });
+  return getYahooSessionCloses(result);
+}
+
+// 15분봉 기준 히스토리(표시 구간 + 전일 종가)
 async function loadBaseHistory(item, days, usePfsymbol = false) {
   const interval = CHART_INTERVAL;
   if (item.source === 'hl' || usePfsymbol) {
     const lookbackMs = (days === 1 ? 36 : 60) * 3600 * 1000;
     const coin = usePfsymbol ? item.pfsymbol : item.symbol;
-    const [arr, regularClose] = await Promise.all([
+    const period1 = new Date(Date.now() - 6 * 24 * 3600 * 1000);
+    const sessionClosesPromise = item.source === 'naver'
+      ? (async () => {
+        const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });
+        const [year, month, day] = today.split('-').map(Number);
+        const startDate = new Date(Date.UTC(year, month - 1, day - 7))
+          .toISOString().slice(0, 10).replaceAll('-', '');
+        const rows = await fetchNaverIndexHistory(item.symbol, startDate, today.replaceAll('-', ''));
+        return getNaverSessionCloses(rows);
+      })()
+      : item.market === 'US'
+        ? fetchYahooSessionCloses(item.symbol, period1)
+        : Promise.resolve([]);
+    const [arr, regularClose, sessionCloses] = await Promise.all([
       fetchHLCandles(coin, interval, Date.now() - lookbackMs, Date.now()),
       usePfsymbol && item.source === 'naver'
         ? fetchNaverLatestClose(item.symbol)
         : Promise.resolve(0),
+      sessionClosesPromise.catch(e => {
+        logThrottled('session-close:' + item.id, '[session close] ' + item.id + ' 데이터 조회 실패:', e?.message || e);
+        return [];
+      }),
     ]);
     const points = arr
       .map(c => ({ time: Math.floor(c.t / 1000), value: parseFloat(c.c) }))
       .filter(p => Number.isFinite(p.value))
       .sort((a, b) => a.time - b.time);
 
-    if (points.length === 0) return { points: [], prevClose: 0 };
+    if (points.length === 0) return { points: [], prevClose: 0, sessionCloses };
 
     const now = new Date();
     const utcMidnightToday = Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) / 1000);
@@ -292,16 +381,18 @@ async function loadBaseHistory(item, days, usePfsymbol = false) {
       prevClose,
       open: Number.isFinite(openRaw) && openRaw > 0 ? openRaw : prevClose,
       close: usePfsymbol ? regularClose : shown[shown.length - 1].value,
+      sessionCloses,
     };
   }
 
   if (item.source === 'naver') {
-    const today = zonedParts(new Date(), 'Asia/Seoul').dateStr;
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });
     const [year, month, day] = today.split('-').map(Number);
     const startDate = new Date(Date.UTC(year, month - 1, day - 7))
       .toISOString().slice(0, 10).replaceAll('-', '');
     const endDate = today.replaceAll('-', '');
     const rows = await fetchNaverIndexHistory(item.symbol, startDate, endDate);
+    const sessionCloses = getNaverSessionCloses(rows);
     const minutePoints = rows
       .map(row => {
         const stamp = row.localDateTime;
@@ -325,7 +416,7 @@ async function loadBaseHistory(item, days, usePfsymbol = false) {
       .filter(p => p && Number.isFinite(p.time) && Number.isFinite(p.value) && p.bucket >= 0)
       .sort((a, b) => a.time - b.time);
 
-    if (minutePoints.length === 0) return { points: [], prevClose: 0 };
+    if (minutePoints.length === 0) return { points: [], prevClose: 0, sessionCloses };
 
     const buckets = new Map();
     for (const point of minutePoints) {
@@ -347,13 +438,14 @@ async function loadBaseHistory(item, days, usePfsymbol = false) {
     const lastDisplayDay = targetDays[targetDays.length - 1];
     const firstOfDay = minutePoints.find(p => p.dayStr === lastDisplayDay);
     const open = firstOfDay && firstOfDay.open > 0 ? firstOfDay.open : (firstOfDay ? firstOfDay.value : 0);
-    return { points: displayPoints, prevClose, open, close: displayPoints[displayPoints.length - 1].value };
+    return { points: displayPoints, prevClose, open, close: displayPoints[displayPoints.length - 1].value, sessionCloses };
   }
 
   // 최근 거래일과 전일 종가를 포함하도록 Yahoo 15분봉을 6일 조회한다.
   const lookbackDays = 6;
   const period1 = new Date(Date.now() - lookbackDays * 24 * 3600 * 1000);
   const result = await yahooFinance.chart(item.symbol, { period1, interval });
+  const sessionCloses = getYahooSessionCloses(result);
   const quotes = Array.isArray(result.quotes) ? result.quotes : [];
   const tz = item.market === 'KR' ? 'Asia/Seoul' : 'America/New_York';
 
@@ -374,7 +466,7 @@ async function loadBaseHistory(item, days, usePfsymbol = false) {
   for (const point of bucketed) pointsByTime.set(point.time, point);
   const valid = Array.from(pointsByTime.values());
 
-  if (valid.length === 0) return { points: [], prevClose: 0 };
+  if (valid.length === 0) return { points: [], prevClose: 0, sessionCloses };
 
   const uniqueDays = Array.from(new Set(valid.map(v => v.dayStr)));
   const targetDays = uniqueDays.slice(-days);
@@ -401,59 +493,20 @@ async function loadBaseHistory(item, days, usePfsymbol = false) {
   const lastDay = uniqueDays[uniqueDays.length - 1];
   const firstOfDay = valid.find(v => v.dayStr === lastDay);
   const open = firstOfDay && firstOfDay.open > 0 ? firstOfDay.open : (firstOfDay ? firstOfDay.value : 0);
-  return { points: displayPoints, prevClose, open, close: valid[valid.length - 1].value };
-}
-
-// ───────────────────────── Yahoo quote 스냅샷 (기준가 / 장외가격) ─────────────────────────
-// quote 한 번에 시작가(regularMarketOpen), 정규장 종가(regularMarketPrice), 장외 가격(pre/postMarketPrice)이 들어 있다.
-// 장외 가격은 marketState 가 REGULAR 가 아닐 때만 유효한 것으로 본다. 장외 가격이 없는 종목(지수, 환율 등)은 hasExt=false.
-const yahooSnapshot = new Map();   // symbol -> { state, open, close, hasExt, price, time }
-let yahooSnapshotAt = 0;
-let yahooSnapshotPromise = null;
-
-function positiveNumber(v) { return Number.isFinite(v) && v > 0 ? v : 0; }
-function toMillis(t) { return t instanceof Date ? t.getTime() : new Date(t).getTime(); }
-
-function summarizeYahooQuote(q) {
-  const state = typeof q.marketState === 'string' ? q.marketState : '';
-  const isPre = state === 'PRE' || state === 'PREPRE';
-  const extPrice = positiveNumber(isPre ? q.preMarketPrice : q.postMarketPrice);
-  const extTime = toMillis(isPre ? q.preMarketTime : q.postMarketTime);
-  const hasExt = state !== 'REGULAR' && extPrice > 0;
-  const fullDayPrice = positiveNumber(q.regularMarketPrice);
-  const fullDayChange = Number.isFinite(q.regularMarketChange) ? q.regularMarketChange : NaN;
-  const previousClose = positiveNumber(fullDayPrice - fullDayChange) ||
-    positiveNumber(q.regularMarketPreviousClose);
-  return {
-    state,
-    open: positiveNumber(q.regularMarketOpen),
-    close: fullDayPrice,
-    previousClose,
-    hasExt,
-    price: hasExt ? extPrice : q.regularMarketPrice,       // 헤더에 보여줄 가격 (장외가격 우선)
-    time: hasExt && Number.isFinite(extTime) ? extTime : toMillis(q.regularMarketTime),
-  };
-}
-
-// 여러 호출(15초 폴러, 히스토리 요청)이 겹쳐도 quote 요청은 5초에 한 번만 나간다.
-function refreshYahooSnapshot() {
-  if (yahooSnapshotPromise) return yahooSnapshotPromise;
-  if (Date.now() - yahooSnapshotAt < 5_000) return Promise.resolve();
-  yahooSnapshotPromise = yahooFinance.quote(YAHOO_ITEMS.map(item => item.symbol))
-    .then((quotes) => {
-      for (const q of quotes) yahooSnapshot.set(q.symbol, summarizeYahooQuote(q));
-      yahooSnapshotAt = Date.now();
-    })
-    .finally(() => { yahooSnapshotPromise = null; });
-  return yahooSnapshotPromise;
+  return { points: displayPoints, prevClose, open, close: valid[valid.length - 1].value, sessionCloses };
 }
 
 // ───────────────────────── HTTP 라우트 ─────────────────────────
 app.get('/chart-lib.js', (req, res) => res.sendFile(chartLibPath));
 
-app.get('/api/symbols', (req, res) => {
+app.get('/api/symbols', async (req, res) => {
+  try {
+    await refreshYahooSnapshot();
+  } catch (e) {
+    logThrottled('yahoo-snapshot-symbols', '[Yahoo] symbols 스냅샷 갱신 실패:', e?.message || e);
+  }
   const now = new Date();
-  res.json(SYMBOLS.map(s => ({ ...s, isOpen: isMarketOpen(s.market, now) })));
+  res.json(SYMBOLS.map(s => ({ ...s, isOpen: isRegularMarketOpen(s, now) })));
 });
 
 app.get('/api/history', async (req, res) => {
@@ -464,8 +517,11 @@ app.get('/api/history', async (req, res) => {
   if (!INTERVALS.has(interval)) return res.status(400).json({ error: 'Invalid interval' });
 
   try {
-    // 15분봉 히스토리는 종목/일수별로 캐시하고 그대로 반환한다.
-    const usePfsymbol = Boolean(item.pfsymbol && !isMarketOpen(item.market));
+    if (item.source === 'yahoo') {
+      try { await refreshYahooSnapshot(); } catch (e) { logThrottled('yahoo-snapshot', '[Yahoo] quote 스냅샷 실패:', e?.message || e); }
+    }
+    const isOpen = isRegularMarketOpen(item);
+    const usePfsymbol = Boolean(item.pfsymbol && !isOpen);
     const cacheKey = id + '|' + days + '|' + (usePfsymbol ? 'hl' : 'regular');
     const base = await cached(cacheKey, HISTORY_TTL_MS, () => loadBaseHistory(item, days, usePfsymbol));
     // 기준가 재료: 시작가(open) / 정규장 종가(close) / 장외가격 존재 여부(ext). 어떤 값을 쓸지는 클라이언트가 장 상태로 고른다.
@@ -474,10 +530,9 @@ app.get('/api/history', async (req, res) => {
       close: base.close || 0,
       previousClose: base.prevClose || 0,
       ext: false,
-      regular: isMarketOpen(item.market),
+      regular: isOpen,
     };
     if (item.source === 'yahoo') {
-      try { await refreshYahooSnapshot(); } catch (e) { logThrottled('yahoo-snapshot', '[Yahoo] quote 스냅샷 실패:', e?.message || e); }
       const snap = yahooSnapshot.get(item.symbol);
       if (snap) {
         info = {
@@ -485,13 +540,18 @@ app.get('/api/history', async (req, res) => {
           close: snap.close || info.close,
           previousClose: snap.previousClose || info.previousClose,
           ext: snap.hasExt,
-          regular: isMarketOpen(item.market),
+          regular: isOpen,
           price: snap.price,
           time: Math.floor(snap.time / 1000),
         };
       }
     }
-    return res.json({ points: base.points, prevClose: base.prevClose, base: info });
+    return res.json({
+      points: base.points,
+      prevClose: base.prevClose,
+      base: info,
+      sessionCloses: base.sessionCloses || [],
+    });
   } catch (err) {
     logThrottled('history:' + id, '[history] ' + id + ' 실패:', err?.message || err);
     return res.json({ points: [], prevClose: 0, error: true });
@@ -578,45 +638,9 @@ function tickFormatter(time, type) {
   return type <= 2 ? kstDate.format(d) : kstTime.format(d);
 }
 
-function getZonedDateParts(date, timeZone) {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hour12: false,
-  }).formatToParts(date);
-  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
-  return {
-    date: values.year + '-' + values.month + '-' + values.day,
-    minutes: (Number(values.hour) % 24) * 60 + Number(values.minute),
-  };
-}
-
-function getZonedCloseTime(date, timeZone, closeMinutes) {
-  const [year, month, day] = date.split('-').map(Number);
-  const target = Date.UTC(year, month - 1, day, Math.floor(closeMinutes / 60), closeMinutes % 60);
-  let timestamp = target;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const local = getZonedDateParts(new Date(timestamp), timeZone);
-    const [localYear, localMonth, localDay] = local.date.split('-').map(Number);
-    const represented = Date.UTC(
-      localYear, localMonth - 1, localDay,
-      Math.floor(local.minutes / 60), local.minutes % 60
-    );
-    timestamp += target - represented;
-  }
-  return Math.floor(timestamp / 1000);
-}
-
-function getSessionCloseSettings(market) {
-  if (market === 'KR') return { timeZone: 'Asia/Seoul', closeMinutes: 15 * 60 + 30 };
-  if (market === 'US') return { timeZone: 'America/New_York', closeMinutes: 16 * 60 };
-  return null;
-}
-
 function positionSessionCloseMarkers(ctx) {
   ctx.markerLayer.replaceChildren();
-  if (!ctx.sessionDays.size) return;
-  const settings = getSessionCloseSettings(ctx.item.market);
-  if (!settings) return;
+  if (!ctx.sessionCloses.length) return;
 
   const timeScale = ctx.chart.timeScale();
   const range = timeScale.getVisibleRange();
@@ -625,8 +649,7 @@ function positionSessionCloseMarkers(ctx) {
   const to = Number(range.to);
   const intervalSeconds = Number.parseInt(CHART_INTERVAL, 10) * 60;
 
-  for (const date of ctx.sessionDays) {
-    const closeTime = getZonedCloseTime(date, settings.timeZone, settings.closeMinutes);
+  for (const closeTime of ctx.sessionCloses) {
     if (closeTime < from - intervalSeconds || closeTime > to + intervalSeconds) continue;
 
     let x = timeScale.timeToCoordinate(closeTime);
@@ -659,11 +682,11 @@ function fmt(v) {
 
 function getMarketBadge(item, isOpen) {
   if (isOpen) return item.market;
-  return item.pfsymbol && item.source === 'yahoo' ? 'PF' : '마감';
+  return item.pfsymbol ? 'PF' : '마감';
 }
 
 function isPfMarket(item, isOpen) {
-  return !isOpen && Boolean(item.pfsymbol && item.source === 'yahoo');
+  return !isOpen && Boolean(item.pfsymbol);
 }
 
 function updateHeader(ctx, price, priceTime = ctx.lastTime) {
@@ -735,13 +758,17 @@ async function refreshStatus() {
   try {
     const res = await fetch('/api/symbols');
     const symbols = await res.json();
-    let reloadPfsymbolHistory = false;
+    let reloadHistory = false;
     for (const s of symbols) {
       const ctx = cards.get(s.id);
-      if (ctx?.item.pfsymbol && ctx.isOpen !== s.isOpen) reloadPfsymbolHistory = true;
-      if (ctx) applyStatus(ctx, s.isOpen);
+      if (ctx && ctx.isOpen !== s.isOpen) {
+        if (ctx.item.pfsymbol || ctx.item.market === 'KR' || ctx.item.market === 'US') {
+          reloadHistory = true;
+        }
+        applyStatus(ctx, s.isOpen);
+      }
     }
-    if (reloadPfsymbolHistory) await loadAll();
+    if (reloadHistory) await loadAll();
   } catch (e) {
     console.error('status refresh failed', e);
   }
@@ -831,7 +858,7 @@ async function init() {
       item, chart, series, card, badge, prevClose: 0, previousClose: 0,
       currentPrice: 0, currentPriceTime: 0, isOpen: item.isOpen, yahooBase: null,
       lastTime: 0, prevLine: null,
-      chartEl: chEl, markerLayer, sessionDays: new Set(), timeEl: timeSpan,
+      chartEl: chEl, markerLayer, sessionCloses: [], timeEl: timeSpan,
       priceEl: priceSpan,
       pctEl: pctSpan
     };
@@ -858,20 +885,21 @@ async function loadOne(id, ctx, days, seq, attempt = 0) {
       (ctx.item.source === 'naver' && points.length === 0);
     if (needRetry && attempt < 3) {
       setTimeout(() => {
-        if (seq === loadSeq) loadOne(id, ctx, days, seq, attempt + 1);   // 낡은 요청이면 재시도 안 함
+        if (seq === loadSeq) loadOne(id, ctx, days, seq, attempt + 1);
       }, 2000 * (attempt + 1));
     }
     ctx.previousClose = data.prevClose || 0;
+    ctx.sessionCloses = Array.isArray(data.sessionCloses)
+      ? data.sessionCloses.filter(Number.isFinite)
+      : [];
     ctx.yahooBase = data.base || null;
     if (Number.isFinite(ctx.yahooBase?.previousClose) && ctx.yahooBase.previousClose > 0) {
       ctx.previousClose = ctx.yahooBase.previousClose;
     }
-    if (typeof ctx.yahooBase?.regular === 'boolean') ctx.isOpen = ctx.yahooBase.regular;
+    if (typeof ctx.yahooBase?.regular === 'boolean') {
+      applyStatus(ctx, ctx.yahooBase.regular);
+    }
     setReferencePrice(ctx, getReferencePrice(ctx));
-    const closeSettings = getSessionCloseSettings(ctx.item.market);
-    ctx.sessionDays = new Set(closeSettings
-      ? points.map(point => getZonedDateParts(new Date(point.time * 1000), closeSettings.timeZone).date)
-      : []);
     ctx.series.setData(points);                        // 빈 배열이면 이전 간격의 잔상도 지움
     ctx.lastTime = 0;
     positionSessionCloseMarkers(ctx);
@@ -917,7 +945,13 @@ function connectWs(seq) {
       if (Number.isFinite(msg.base.previousClose) && msg.base.previousClose > 0) {
         ctx.previousClose = msg.base.previousClose;
       }
-      if (typeof msg.base.regular === 'boolean') ctx.isOpen = msg.base.regular;
+      if (typeof msg.base.regular === 'boolean' && ctx.isOpen !== msg.base.regular) {
+        applyStatus(ctx, msg.base.regular);
+        if (ctx.item.pfsymbol) {
+          loadAll();
+          return;
+        }
+      }
       setReferencePrice(ctx, getReferencePrice(ctx));
     }
     // 한 메시지에 quote(헤더용)와 point(차트용)가 함께 올 수 있으므로 둘 다 처리한다.
@@ -928,11 +962,6 @@ function connectWs(seq) {
       if (msg.point.time >= ctx.lastTime) {
         ctx.series.update(msg.point);
         ctx.lastTime = msg.point.time;
-        const closeSettings = getSessionCloseSettings(ctx.item.market);
-        if (closeSettings) {
-          ctx.sessionDays.add(getZonedDateParts(new Date(msg.point.time * 1000), closeSettings.timeZone).date);
-          positionSessionCloseMarkers(ctx);
-        }
       }
     }
   };
@@ -1031,7 +1060,7 @@ function connectHL(feed) {
     if (!Number.isFinite(value) || !Number.isFinite(candleStart)) return;
     const now = Date.now();
     for (const target of targets) {
-      if (target.source !== 'hl' && isMarketOpen(target.market)) continue;
+      if (target.source !== 'hl' && isRegularMarketOpen(target)) continue;
       broadcast(feed, {
         id: target.id,
         point: { time: Math.floor(candleStart / 1000), value },
@@ -1060,7 +1089,7 @@ function startYahooChartPoller(feed) {
   let busy = false;
   feed.yahooChartTimer = setInterval(async () => {
     if (busy || feed.closed) return;
-    const open = YAHOO_ITEMS.filter(s => isMarketOpen(s.market));   // 매 틱마다 개장 여부 재계산
+    const open = YAHOO_ITEMS.filter(s => isRegularMarketOpen(s));
     if (open.length === 0) return;
     const item = open[idx++ % open.length];
 
@@ -1093,7 +1122,8 @@ function startYahooQuotePoller(feed) {
     try {
       await refreshYahooSnapshot();
       for (const item of YAHOO_ITEMS) {
-        if (item.pfsymbol && !isMarketOpen(item.market)) continue;
+        const isOpen = isRegularMarketOpen(item);
+        if (item.pfsymbol && !isOpen) continue;
         const snap = yahooSnapshot.get(item.symbol);
         if (!snap || !Number.isFinite(snap.price) || !Number.isFinite(snap.time)) {
           logThrottled('yahoo-quote:' + item.id, '[Yahoo] ' + item.id + ' quote 값 없음');
@@ -1107,8 +1137,9 @@ function startYahooQuotePoller(feed) {
             base: {
               open: snap.open,
               close: snap.close,
+              previousClose: snap.previousClose,
               ext: snap.hasExt,
-              regular: isMarketOpen(item.market),
+              regular: isOpen,
             },
           });
         }
@@ -1126,7 +1157,7 @@ function startYahooQuotePoller(feed) {
 function startNaverPoller(feed) {
   let busy = false;
   feed.naverTimer = setInterval(async () => {
-    if (busy || feed.closed || !isMarketOpen('KR')) return;
+    if (busy || feed.closed || !isMarketOpenByClock('KR')) return;
     busy = true;
     try {
       // 종목별로 독립 처리: 하나가 실패해도 나머지 업데이트는 그대로 전송한다.
