@@ -306,8 +306,8 @@ async function loadBaseHistory(item, days) {
     const displayPoints = points
       .filter(p => targetDays.includes(p.dayStr))
       .map(({ time, value }) => ({ time, value }));
-    const firstDisplayDay = targetDays[0];
-    const previousDayPoints = points.filter(p => p.dayStr < firstDisplayDay);
+    const latestDisplayDay = targetDays[targetDays.length - 1];
+    const previousDayPoints = points.filter(p => p.dayStr < latestDisplayDay);
     const prevClose = previousDayPoints.length > 0
       ? previousDayPoints[previousDayPoints.length - 1].value
       : displayPoints[0].value;
@@ -446,7 +446,7 @@ app.get('/api/history', async (req, res) => {
         info = {
           open: snap.open || info.open,
           close: snap.close || info.close,
-          previousClose: snap.previousClose || info.previousClose,
+          previousClose: info.previousClose || snap.previousClose,
           ext: snap.hasExt,
           regular: isMarketOpen(item.market),
           price: snap.price,
@@ -1047,7 +1047,6 @@ function startYahooQuotePoller(feed) {
             base: {
               open: snap.open,
               close: snap.close,
-              previousClose: snap.previousClose,
               ext: snap.hasExt,
               regular: isMarketOpen(item.market),
             },
