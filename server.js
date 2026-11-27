@@ -25,7 +25,7 @@ const NAVER_INDEX_CHART_URL = 'https://api.stock.naver.com/chart/domestic/index/
 const INTERVALS = new Set(['1m', '5m', '15m']);
 const HISTORY_TTL_MS = 45_000;
 
-const yahooFinance = new YahooFinance();
+const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 1024 });
@@ -615,7 +615,7 @@ function connectWs(seq, interval) {
     if (msg.point.time >= ctx.lastTime) {
       ctx.series.update(msg.point);
       ctx.lastTime = msg.point.time;
-      updateHeader(ctx, msg.point.value);
+      if (ctx.item.source !== 'yahoo') updateHeader(ctx, msg.point.value, msg.point.time);
     }
   };
   sock.onerror = () => {};                              // close 이벤트에서 재연결 처리
@@ -724,10 +724,10 @@ function connectHL(feed) {
   });
 }
 
-function startYahooPoller(feed) {
+function startYahooChartPoller(feed) {
   let idx = 0;
   let busy = false;
-  feed.yahooTimer = setInterval(async () => {
+  feed.yahooChartTimer = setInterval(async () => {
     if (busy || feed.closed) return;
     const open = YAHOO_ITEMS.filter(s => isMarketOpen(s.market));   // 매 틱마다 개장 여부 재계산
     if (open.length === 0) return;
@@ -751,7 +751,42 @@ function startYahooPoller(feed) {
     } finally {
       busy = false;
     }
-  }, 1200);
+  }, 5000);
+}
+
+function startYahooQuotePoller(feed) {
+  let busy = false;
+  const poll = async () => {
+    if (busy || feed.closed) return;
+    busy = true;
+    try {
+      const quotes = await yahooFinance.quote(YAHOO_ITEMS.map(item => item.symbol));
+      const quotesBySymbol = new Map(quotes.map(quote => [quote.symbol, quote]));
+      for (const item of YAHOO_ITEMS) {
+        const quote = quotesBySymbol.get(item.symbol);
+        const price = quote?.regularMarketPrice;
+        const time = quote?.regularMarketTime instanceof Date
+          ? quote.regularMarketTime.getTime()
+          : new Date(quote?.regularMarketTime).getTime();
+        if (!Number.isFinite(price) || !Number.isFinite(time)) {
+          logThrottled('yahoo-quote:' + item.id, '[Yahoo] ' + item.id + ' quote 값 없음');
+          continue;
+        }
+        if (!feed.closed) {
+          broadcast(feed, {
+            id: item.id,
+            quote: { time: Math.floor(time / 1000), value: price },
+          });
+        }
+      }
+    } catch (e) {
+      logThrottled('yahoo-quote', '[Yahoo] quote 폴링 실패:', e?.message || e);
+    } finally {
+      busy = false;
+    }
+  };
+  feed.yahooQuoteTimer = setInterval(poll, 15_000);
+  poll();
 }
 
 function startNaverPoller(feed) {
@@ -782,7 +817,7 @@ function startNaverPoller(feed) {
     } finally {
       busy = false;
     }
-  }, 1200);
+  }, 5000);
 }
 
 function getFeed(interval) {
@@ -790,12 +825,14 @@ function getFeed(interval) {
   if (feed) return feed;
   feed = {
     interval, clients: new Set(), closed: false,
-    hlWs: null, pingTimer: null, reconnectTimer: null, yahooTimer: null, naverTimer: null, idleTimer: null,
+    hlWs: null, pingTimer: null, reconnectTimer: null,
+    yahooChartTimer: null, yahooQuoteTimer: null, naverTimer: null, idleTimer: null,
     attempts: 0, lastMsg: Date.now(),
   };
   feeds.set(interval, feed);
   if (HL_ITEMS.length > 0) connectHL(feed);
-  startYahooPoller(feed);
+  startYahooChartPoller(feed);
+  if (YAHOO_ITEMS.length > 0) startYahooQuotePoller(feed);
   if (NAVER_ITEMS.length > 0) startNaverPoller(feed);
   return feed;
 }
@@ -803,7 +840,8 @@ function getFeed(interval) {
 function stopFeed(feed) {
   feed.closed = true;
   clearInterval(feed.pingTimer);
-  clearInterval(feed.yahooTimer);
+  clearInterval(feed.yahooChartTimer);
+  clearInterval(feed.yahooQuoteTimer);
   clearInterval(feed.naverTimer);
   clearTimeout(feed.reconnectTimer);
   clearTimeout(feed.idleTimer);
