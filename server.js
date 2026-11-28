@@ -749,7 +749,7 @@ function applyStatus(ctx, isOpen) {
   ctx.card.classList.toggle('pf', isPf);
   ctx.badge.classList.toggle('open', isOpen || isPf);
   ctx.badge.textContent = getMarketBadge(ctx.item, isOpen);
-  if (changed && ctx.yahooBase) {
+  if (changed && isPf /*ctx.yahooBase*/) {
     ctx.yahooBase.regular = isOpen;
     setReferencePrice(ctx, getReferencePrice(ctx));
   }
