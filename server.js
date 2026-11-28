@@ -21,23 +21,18 @@ const HL_REST_URL = 'https://api.hyperliquid.xyz/info';
 const HL_WS_URL = 'wss://api.hyperliquid.xyz/ws';
 const NAVER_REALTIME_URL = 'https://polling.finance.naver.com/api/realtime?query=SERVICE_INDEX:';
 const NAVER_INDEX_CHART_URL = 'https://api.stock.naver.com/chart/domestic/index/';
-const YAHOO_PROXY_URL = 'https://ticker-proxy.skykrkrk.workers.dev/';
 const CHART_INTERVAL = '15m';
 const INTERVALS = new Set([CHART_INTERVAL]);
 const HISTORY_TTL_MS = 45_000;
-const YAHOO_SNAPSHOT_MIN_INTERVAL_MS = 5_000;
-const YAHOO_RATE_LIMIT_INITIAL_BACKOFF_MS = 15_000;
+// 프록시 워커 없이 단일 서버 IP로 직접 호출하므로 429 차단 방지를 위해 15초로 완화
+const YAHOO_SNAPSHOT_MIN_INTERVAL_MS = 15_000;
+const YAHOO_CHART_POLL_INTERVAL_MS = 15_000;
+const YAHOO_RATE_LIMIT_INITIAL_BACKOFF_MS = 30_000;
 const YAHOO_RATE_LIMIT_MAX_BACKOFF_MS = 15 * 60_000;
 // Naver index history is returned as minute rows and aggregated into 15-minute bars.
 
 const yahooFinance = new YahooFinance({
   suppressNotices: ['yahooSurvey'],
-  fetch: (input, init) => {
-    const request = new Request(input, init);
-    const proxyUrl = new URL(YAHOO_PROXY_URL);
-    proxyUrl.searchParams.set('url', request.url);
-    return globalThis.fetch(new Request(proxyUrl, request));
-  },
 });
 const app = express();
 const server = createServer(app);
@@ -1148,7 +1143,7 @@ function startYahooChartPoller(feed) {
     } finally {
       busy = false;
     }
-  }, 10000);
+  }, YAHOO_CHART_POLL_INTERVAL_MS);
 }
 
 function startYahooQuotePoller(feed) {
