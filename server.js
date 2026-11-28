@@ -25,8 +25,8 @@ const YAHOO_PROXY_URL = 'https://ticker-proxy.skykrkrk.workers.dev/';
 const CHART_INTERVAL = '15m';
 const INTERVALS = new Set([CHART_INTERVAL]);
 const HISTORY_TTL_MS = 45_000;
-const YAHOO_SNAPSHOT_MIN_INTERVAL_MS = 180_000;
-const YAHOO_RATE_LIMIT_INITIAL_BACKOFF_MS = 60_000;
+const YAHOO_SNAPSHOT_MIN_INTERVAL_MS = 5_000;
+const YAHOO_RATE_LIMIT_INITIAL_BACKOFF_MS = 15_000;
 const YAHOO_RATE_LIMIT_MAX_BACKOFF_MS = 15 * 60_000;
 // Naver index history is returned as minute rows and aggregated into 15-minute bars.
 
@@ -1148,7 +1148,7 @@ function startYahooChartPoller(feed) {
     } finally {
       busy = false;
     }
-  }, 60000);
+  }, 10000);
 }
 
 function startYahooQuotePoller(feed) {
@@ -1229,7 +1229,7 @@ function startNaverPoller(feed) {
     } finally {
       busy = false;
     }
-  }, 60000);
+  }, 10000);
 }
 
 function getFeed(interval) {
