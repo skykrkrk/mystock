@@ -24,6 +24,9 @@ const NAVER_INDEX_CHART_URL = 'https://api.stock.naver.com/chart/domestic/index/
 const CHART_INTERVAL = '15m';
 const INTERVALS = new Set([CHART_INTERVAL]);
 const HISTORY_TTL_MS = 45_000;
+const YAHOO_SNAPSHOT_MIN_INTERVAL_MS = 30_000;
+const YAHOO_RATE_LIMIT_INITIAL_BACKOFF_MS = 60_000;
+const YAHOO_RATE_LIMIT_MAX_BACKOFF_MS = 15 * 60_000;
 // Naver index history is returned as minute rows and aggregated into 15-minute bars.
 
 const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
@@ -140,9 +143,15 @@ function getIntervalBucketTime(date, interval) {
 const yahooSnapshot = new Map();   // symbol -> { state, open, regularClose, previousClose, hasExt, price, time }
 let yahooSnapshotAt = 0;
 let yahooSnapshotPromise = null;
+let yahooSnapshotRetryAt = 0;
+let yahooRateLimitFailures = 0;
 
 function positiveNumber(v) { return Number.isFinite(v) && v > 0 ? v : 0; }
 function toMillis(t) { return t instanceof Date ? t.getTime() : new Date(t).getTime(); }
+
+function isYahooRateLimitError(error) {
+  return Number(error?.code) === 429 || /\b429\b/.test(String(error?.message || error));
+}
 
 function summarizeYahooQuote(q) {
   const state = typeof q.marketState === 'string' ? q.marketState : '';
@@ -167,11 +176,30 @@ function summarizeYahooQuote(q) {
 
 function refreshYahooSnapshot() {
   if (yahooSnapshotPromise) return yahooSnapshotPromise;
-  if (Date.now() - yahooSnapshotAt < 5_000) return Promise.resolve();
+  const now = Date.now();
+  if (now < yahooSnapshotRetryAt) return Promise.resolve();
+  if (now - yahooSnapshotAt < YAHOO_SNAPSHOT_MIN_INTERVAL_MS) return Promise.resolve();
   yahooSnapshotPromise = yahooFinance.quote(YAHOO_ITEMS.map(item => item.symbol))
     .then((quotes) => {
       for (const q of quotes) yahooSnapshot.set(q.symbol, summarizeYahooQuote(q));
       yahooSnapshotAt = Date.now();
+      yahooRateLimitFailures = 0;
+      yahooSnapshotRetryAt = 0;
+    })
+    .catch((error) => {
+      if (isYahooRateLimitError(error)) {
+        yahooRateLimitFailures++;
+        const backoffMs = Math.min(
+          YAHOO_RATE_LIMIT_INITIAL_BACKOFF_MS * 2 ** (yahooRateLimitFailures - 1),
+          YAHOO_RATE_LIMIT_MAX_BACKOFF_MS
+        );
+        yahooSnapshotRetryAt = Date.now() + backoffMs;
+        logThrottled(
+          'yahoo-rate-limit',
+          '[Yahoo] quote rate limited; pausing retries for ' + Math.round(backoffMs / 1000) + 's'
+        );
+      }
+      throw error;
     })
     .finally(() => { yahooSnapshotPromise = null; });
   return yahooSnapshotPromise;
@@ -1150,7 +1178,7 @@ function startYahooQuotePoller(feed) {
       busy = false;
     }
   };
-  feed.yahooQuoteTimer = setInterval(poll, 15_000);
+  feed.yahooQuoteTimer = setInterval(poll, 30_000);
   poll();
 }
 
