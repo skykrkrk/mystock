@@ -712,7 +712,6 @@ function getReferencePrice(ctx) {
   const previousClose = Number.isFinite(base?.previousClose) && base.previousClose > 0
     ? base.previousClose
     : ctx.previousClose;
-    console.log('isRegular: ' + isRegular + ' ctx.item.pfsymbol: ' + ctx.item.pfsymbol + ' ctx.item.source: ' + ctx.item.source);
   if (!isRegular && ctx.item.pfsymbol &&
       Number.isFinite(base?.regularClose) && base.regularClose > 0) {
     return base.regularClose;
@@ -749,7 +748,7 @@ function applyStatus(ctx, isOpen) {
   ctx.card.classList.toggle('pf', isPf);
   ctx.badge.classList.toggle('open', isOpen || isPf);
   ctx.badge.textContent = getMarketBadge(ctx.item, isOpen);
-  if (changed && isPf /*ctx.yahooBase*/) {
+  if (changed && ctx.yahooBase) {
     ctx.yahooBase.regular = isOpen;
     setReferencePrice(ctx, getReferencePrice(ctx));
   }
