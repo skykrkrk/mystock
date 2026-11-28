@@ -21,15 +21,24 @@ const HL_REST_URL = 'https://api.hyperliquid.xyz/info';
 const HL_WS_URL = 'wss://api.hyperliquid.xyz/ws';
 const NAVER_REALTIME_URL = 'https://polling.finance.naver.com/api/realtime?query=SERVICE_INDEX:';
 const NAVER_INDEX_CHART_URL = 'https://api.stock.naver.com/chart/domestic/index/';
+const YAHOO_PROXY_URL = 'https://ticker-proxy.skykrkrk.workers.dev/';
 const CHART_INTERVAL = '15m';
 const INTERVALS = new Set([CHART_INTERVAL]);
 const HISTORY_TTL_MS = 45_000;
-const YAHOO_SNAPSHOT_MIN_INTERVAL_MS = 30_000;
+const YAHOO_SNAPSHOT_MIN_INTERVAL_MS = 180_000;
 const YAHOO_RATE_LIMIT_INITIAL_BACKOFF_MS = 60_000;
 const YAHOO_RATE_LIMIT_MAX_BACKOFF_MS = 15 * 60_000;
 // Naver index history is returned as minute rows and aggregated into 15-minute bars.
 
-const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
+const yahooFinance = new YahooFinance({
+  suppressNotices: ['yahooSurvey'],
+  fetch: (input, init) => {
+    const request = new Request(input, init);
+    const proxyUrl = new URL(YAHOO_PROXY_URL);
+    proxyUrl.searchParams.set('url', request.url);
+    return globalThis.fetch(new Request(proxyUrl, request));
+  },
+});
 const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({
@@ -1139,7 +1148,7 @@ function startYahooChartPoller(feed) {
     } finally {
       busy = false;
     }
-  }, 10000);
+  }, 60000);
 }
 
 function startYahooQuotePoller(feed) {
@@ -1178,7 +1187,7 @@ function startYahooQuotePoller(feed) {
       busy = false;
     }
   };
-  feed.yahooQuoteTimer = setInterval(poll, 30_000);
+  feed.yahooQuoteTimer = setInterval(poll, YAHOO_SNAPSHOT_MIN_INTERVAL_MS);
   poll();
 }
 
@@ -1220,7 +1229,7 @@ function startNaverPoller(feed) {
     } finally {
       busy = false;
     }
-  }, 10000);
+  }, 60000);
 }
 
 function getFeed(interval) {
