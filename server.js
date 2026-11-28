@@ -712,7 +712,7 @@ function getReferencePrice(ctx) {
   const previousClose = Number.isFinite(base?.previousClose) && base.previousClose > 0
     ? base.previousClose
     : ctx.previousClose;
-    console.log("isRegular: " + isRegular + "ctx.item.pfsymbol: " + ctx.item.pfsymbol + "ctx.item.source: " + ctx.item.source);
+    console.log('isRegular: ' + isRegular + ' ctx.item.pfsymbol: ' + ctx.item.pfsymbol + ' ctx.item.source: ' + ctx.item.source);
   if (!isRegular && ctx.item.pfsymbol &&
       Number.isFinite(base?.regularClose) && base.regularClose > 0) {
     return base.regularClose;
